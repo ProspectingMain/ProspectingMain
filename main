@@ -1,1 +1,1715 @@
+--[[
+    SIGMA HUB - REMASTERED  (main.lua)
+    Loaded automatically after key verification passes.
+    Do NOT run this directly — use verify_loader.lua.
+]]
 
+-- // 1. CLEANUP & INIT //
+if _G.SigmaFarm_Connections then
+    for _, conn in pairs(_G.SigmaFarm_Connections) do
+        if conn then conn:Disconnect() end
+    end
+end
+if _G.SigmaFarm_GUI then
+    _G.SigmaFarm_GUI:Destroy()
+end
+_G.SigmaFarm_Connections = {}
+_G.SigmaFarm_Running = true
+
+-- Key was already validated by the loader — access is always granted here.
+local HasAccess = true
+
+-- // FILE SYSTEM SETUP //
+local HttpService        = game:GetService("HttpService")
+local FolderName         = "SigmaConfigs"
+
+local function ResetAllAutomation()
+    local cfg = _G.SigmaFarm_Config
+    if cfg then
+        cfg.AutoShovel     = false
+        cfg.AutoShake      = false
+        cfg.AutoSell       = false
+        cfg.AutoGeode      = false
+        cfg.AutoTotem      = false
+        cfg.AutoManualWalk = false
+        for k, v in pairs(cfg) do
+            if typeof(v) == "boolean" and v then cfg[k] = false end
+        end
+    end
+    _G.SigmaFarm_Running = false
+end
+
+pcall(function()
+    if not isfolder(FolderName) then makefolder(FolderName) end
+end)
+
+local Players              = game:GetService("Players")
+local RunService           = game:GetService("RunService")
+local TweenService         = game:GetService("TweenService")
+local ReplicatedStorage    = game:GetService("ReplicatedStorage")
+local PathfindingService   = game:GetService("PathfindingService")
+local VirtualInputManager  = game:GetService("VirtualInputManager")
+local UserInputService     = game:GetService("UserInputService")
+local LocalPlayer          = Players.LocalPlayer
+
+-- // 2. GAME MODULES & REMOTES //
+local PointToRegion = nil
+pcall(function()
+    PointToRegion = require(game.ReplicatedStorage.Modules.Location.PointToRegion)
+end)
+
+local SellRemote                  = nil
+local GetInventorySellPriceRemote = nil
+local LockRemote                  = nil
+local ValuablesFolder             = nil
+local PansFolder                  = nil
+
+task.spawn(function()
+    pcall(function() SellRemote = ReplicatedStorage.Remotes.Info.SellAll end)
+    if not SellRemote then
+        pcall(function() SellRemote = ReplicatedStorage.Remotes.Shop.SellAll end)
+    end
+
+    pcall(function() GetInventorySellPriceRemote = ReplicatedStorage.Remotes.Info.GetInventorySellPrice end)
+    if not GetInventorySellPriceRemote then
+        pcall(function() GetInventorySellPriceRemote = ReplicatedStorage.Remotes.Shop.GetInventorySellPrice end)
+    end
+
+    pcall(function() LockRemote = ReplicatedStorage.Remotes.Shop.Replication.ToggleLock end)
+    if not LockRemote then
+        pcall(function() LockRemote = ReplicatedStorage.Remotes.Inventory.ToggleLock end)
+    end
+
+    pcall(function()
+        local items = ReplicatedStorage:WaitForChild("Items", 5)
+        if items then
+            ValuablesFolder = items:WaitForChild("Valuables", 5)
+            PansFolder      = items:WaitForChild("Pans", 5)
+        end
+    end)
+end)
+
+local Config = {
+    AutoShovel     = false,
+    AutoShake      = false,
+    AutoSell       = false,
+    AutoGeode      = false,
+    AutoManualWalk = false,
+    AutoTotem      = false,
+
+    SandSpot  = nil,
+    WaterSpot = nil,
+    TotemSpot = nil,
+
+    LockedItems = {},
+
+    IsPanning            = false,
+    CurrentTarget        = nil,
+    IsMoving             = false,
+    IsSelling            = false,
+    IsGeodeCollecting    = false,
+    IsPlacingTotem       = false,
+    ProcessedInstances   = {},
+    StatusMessageOverride = nil,
+    PanFullTime          = 0
+}
+_G.SigmaFarm_Config = Config
+
+local ToggleUpdaters    = {}
+local RefreshFilterListRef = nil
+
+-- // 3. CONFIG FUNCTIONS //
+local function SaveConfig(name)
+    if not name or name == "" then return end
+    local data = {
+        AutoShovel  = Config.AutoShovel,
+        AutoShake   = Config.AutoShake,
+        AutoSell    = Config.AutoSell,
+        AutoGeode   = Config.AutoGeode,
+        AutoTotem   = Config.AutoTotem,
+        LockedItems = Config.LockedItems
+    }
+    pcall(function()
+        writefile(FolderName .. "/" .. name .. ".json", HttpService:JSONEncode(data))
+    end)
+end
+
+local function LoadConfig(name)
+    local ok, content = pcall(readfile, FolderName .. "/" .. name .. ".json")
+    if not ok or not content then warn("Config file not found:", name) return end
+    local dok, data = pcall(HttpService.JSONDecode, HttpService, content)
+    if not dok or not data then warn("Failed to parse config:", name) return end
+
+    Config.AutoShovel  = data.AutoShovel  or false
+    Config.AutoShake   = data.AutoShake   or false
+    Config.AutoSell    = data.AutoSell    or false
+    Config.AutoGeode   = data.AutoGeode   or false
+    Config.AutoTotem   = data.AutoTotem   or false
+    Config.LockedItems = data.LockedItems or {}
+
+    if ToggleUpdaters["Auto Shovel"]         then ToggleUpdaters["Auto Shovel"](Config.AutoShovel) end
+    if ToggleUpdaters["Auto Pan & Shake"]    then ToggleUpdaters["Auto Pan & Shake"](Config.AutoShake) end
+    if ToggleUpdaters["Auto Sell"]           then ToggleUpdaters["Auto Sell"](Config.AutoSell) end
+    if ToggleUpdaters["Auto Collect Geodes"] then ToggleUpdaters["Auto Collect Geodes"](Config.AutoGeode) end
+    if ToggleUpdaters["Auto Place Totem"]    then ToggleUpdaters["Auto Place Totem"](Config.AutoTotem) end
+
+    if RefreshFilterListRef then RefreshFilterListRef("") end
+end
+
+local function SetAutoload(name)    pcall(writefile, FolderName .. "/autoload.txt", name) end
+local function ClearAutoload()
+    pcall(function()
+        if isfile(FolderName .. "/autoload.txt") then delfile(FolderName .. "/autoload.txt") end
+    end)
+end
+local function GetAutoload()
+    local ok, content = pcall(readfile, FolderName .. "/autoload.txt")
+    if ok and content then return content:match("[^/\\]+$") or content end
+    return nil
+end
+local function DeleteConfig(name)
+    pcall(function()
+        if isfile(FolderName .. "/" .. name .. ".json") then delfile(FolderName .. "/" .. name .. ".json") end
+    end)
+end
+local function GetConfigList()
+    local ok, files = pcall(listfiles, FolderName)
+    if not ok or not files then return {} end
+    local names = {}
+    for _, file in pairs(files) do
+        if file:sub(-5) == ".json" then
+            local n = (file:match("[^/\\]+$") or file):gsub("%.json$","")
+            table.insert(names, n)
+        end
+    end
+    return names
+end
+
+-- // 4. UI CREATION //
+local Theme = {
+    Bg         = Color3.fromRGB(10, 10, 15),
+    Panel      = Color3.fromRGB(16, 16, 24),
+    Header     = Color3.fromRGB(13, 13, 20),
+    TextMain   = Color3.fromRGB(228, 228, 238),
+    TextDim    = Color3.fromRGB(100, 100, 120),
+    Accent     = Color3.fromRGB(0, 220, 150),
+    ToggleOff  = Color3.fromRGB(30, 30, 42),
+    Stroke     = Color3.fromRGB(38, 38, 55),
+    StatusBg   = Color3.fromRGB(12, 12, 18),
+    Red        = Color3.fromRGB(255, 70, 80),
+    Orange     = Color3.fromRGB(255, 160, 50),
+    InfoBg     = Color3.fromRGB(8, 8, 14),
+    Button     = Color3.fromRGB(22, 22, 34),
+    WarningBg  = Color3.fromRGB(12, 10, 14),
+    KeybindBg  = Color3.fromRGB(18, 18, 28),
+    RowBg      = Color3.fromRGB(18, 18, 26),
+    Divider    = Color3.fromRGB(28, 28, 40),
+}
+
+local ScreenGui = Instance.new("ScreenGui")
+ScreenGui.Name         = "SigmaHubRemastered_UI"
+ScreenGui.ResetOnSpawn = false
+ScreenGui.Parent       = LocalPlayer:WaitForChild("PlayerGui")
+_G.SigmaFarm_GUI       = ScreenGui
+
+-- Floating toggle button
+local ToggleBtn = Instance.new("TextButton")
+ToggleBtn.Name            = "SigmaToggle"
+ToggleBtn.Size            = UDim2.new(0, 46, 0, 46)
+ToggleBtn.Position        = UDim2.new(0, 12, 0.42, 0)
+ToggleBtn.BackgroundColor3 = Color3.fromRGB(14, 14, 22)
+ToggleBtn.Text            = ""
+ToggleBtn.AutoButtonColor = false
+ToggleBtn.ZIndex          = 1000
+ToggleBtn.Parent          = ScreenGui
+Instance.new("UICorner", ToggleBtn).CornerRadius = UDim.new(1, 0)
+
+local ToggleShadow = Instance.new("UIStroke")
+ToggleShadow.Color       = Theme.Accent
+ToggleShadow.Thickness   = 1.5
+ToggleShadow.Transparency = 0.4
+ToggleShadow.Parent      = ToggleBtn
+
+local ToggleIcon = Instance.new("TextLabel")
+ToggleIcon.Size              = UDim2.new(1, 0, 1, 0)
+ToggleIcon.BackgroundTransparency = 1
+ToggleIcon.Text              = "Σ"
+ToggleIcon.TextColor3        = Theme.Accent
+ToggleIcon.Font              = Enum.Font.GothamBlack
+ToggleIcon.TextSize          = 22
+ToggleIcon.Parent            = ToggleBtn
+
+task.spawn(function()
+    while ToggleBtn and ToggleBtn.Parent do
+        TweenService:Create(ToggleShadow, TweenInfo.new(1.2, Enum.EasingStyle.Sine, Enum.EasingDirection.InOut), {Transparency = 0.7}):Play()
+        task.wait(1.2)
+        TweenService:Create(ToggleShadow, TweenInfo.new(1.2, Enum.EasingStyle.Sine, Enum.EasingDirection.InOut), {Transparency = 0.1}):Play()
+        task.wait(1.2)
+    end
+end)
+
+local tDragging, tDragStart, tStartPos
+ToggleBtn.InputBegan:Connect(function(input)
+    if input.UserInputType == Enum.UserInputType.MouseButton1 or input.UserInputType == Enum.UserInputType.Touch then
+        tDragging = true
+        tDragStart = input.Position
+        tStartPos  = ToggleBtn.Position
+        input.Changed:Connect(function() if input.UserInputState == Enum.UserInputState.End then tDragging = false end end)
+    end
+end)
+ToggleBtn.InputChanged:Connect(function(input)
+    if tDragging and (input.UserInputType == Enum.UserInputType.MouseMovement or input.UserInputType == Enum.UserInputType.Touch) then
+        local delta = input.Position - tDragStart
+        ToggleBtn.Position = UDim2.new(tStartPos.X.Scale, tStartPos.X.Offset + delta.X, tStartPos.Y.Scale, tStartPos.Y.Offset + delta.Y)
+    end
+end)
+ToggleBtn.MouseButton1Click:Connect(function()
+    local MF = ScreenGui:FindFirstChild("MainFrame")
+    if MF then MF.Visible = not MF.Visible end
+end)
+
+-- ==========================================
+--   SETUP GUIDE (3-page modal)
+-- ==========================================
+local WarningDimmer = Instance.new("Frame")
+WarningDimmer.Name                 = "WarningDimmer"
+WarningDimmer.Size                 = UDim2.new(1, 0, 1, 0)
+WarningDimmer.BackgroundColor3     = Color3.new(0, 0, 0)
+WarningDimmer.BackgroundTransparency = 1
+WarningDimmer.ZIndex               = 900
+WarningDimmer.Parent               = ScreenGui
+
+local WarningFrame = Instance.new("Frame")
+WarningFrame.Name              = "WarningFrame"
+WarningFrame.Size              = UDim2.new(0, 0, 0, 0)
+WarningFrame.Position          = UDim2.new(0.5, 0, 0.5, 0)
+WarningFrame.AnchorPoint       = Vector2.new(0.5, 0.5)
+WarningFrame.BackgroundColor3  = Theme.WarningBg
+WarningFrame.ClipsDescendants  = true
+WarningFrame.ZIndex            = 901
+WarningFrame.Parent            = ScreenGui
+Instance.new("UICorner", WarningFrame).CornerRadius = UDim.new(0, 18)
+
+local WarnStroke = Instance.new("UIStroke")
+WarnStroke.Color       = Theme.Accent
+WarnStroke.Thickness   = 1
+WarnStroke.Transparency = 0.35
+WarnStroke.Parent      = WarningFrame
+
+local WarnAccentBar = Instance.new("Frame")
+WarnAccentBar.Size             = UDim2.new(1, 0, 0, 3)
+WarnAccentBar.BackgroundColor3 = Theme.Accent
+WarnAccentBar.BorderSizePixel  = 0
+WarnAccentBar.ZIndex           = 902
+WarnAccentBar.Parent           = WarningFrame
+local WarnBarGrad = Instance.new("UIGradient")
+WarnBarGrad.Color = ColorSequence.new({
+    ColorSequenceKeypoint.new(0,   Color3.new(0,0,0)),
+    ColorSequenceKeypoint.new(0.3, Theme.Accent),
+    ColorSequenceKeypoint.new(0.7, Theme.Accent),
+    ColorSequenceKeypoint.new(1,   Color3.new(0,0,0)),
+})
+WarnBarGrad.Parent = WarnAccentBar
+
+-- Page dots
+local DotsHolder = Instance.new("Frame")
+DotsHolder.Size               = UDim2.new(0, 48, 0, 10)
+DotsHolder.Position           = UDim2.new(1, -60, 0, 14)
+DotsHolder.BackgroundTransparency = 1
+DotsHolder.ZIndex             = 904
+DotsHolder.Parent             = WarningFrame
+local DotsLayout = Instance.new("UIListLayout")
+DotsLayout.FillDirection      = Enum.FillDirection.Horizontal
+DotsLayout.Padding            = UDim.new(0, 6)
+DotsLayout.VerticalAlignment  = Enum.VerticalAlignment.Center
+DotsLayout.Parent             = DotsHolder
+
+local pageDots = {}
+for i = 1, 3 do
+    local dot = Instance.new("Frame")
+    dot.Size             = UDim2.new(0, 8, 0, 8)
+    dot.BackgroundColor3 = i == 1 and Theme.Accent or Color3.fromRGB(38, 38, 55)
+    dot.ZIndex           = 904
+    dot.Parent           = DotsHolder
+    Instance.new("UICorner", dot).CornerRadius = UDim.new(1, 0)
+    pageDots[i]          = dot
+end
+
+-- Helpers
+local function createKeyRow(parent, keyLabel, descText, yPos, zBase)
+    local row = Instance.new("Frame")
+    row.Size = UDim2.new(1, -24, 0, 30); row.Position = UDim2.new(0, 12, 0, yPos)
+    row.BackgroundTransparency = 1; row.ZIndex = zBase; row.Parent = parent
+    local badge = Instance.new("Frame")
+    badge.Size = UDim2.new(0, 36, 0, 26); badge.Position = UDim2.new(0, 0, 0.5, -13)
+    badge.BackgroundColor3 = Color3.fromRGB(18, 18, 30); badge.ZIndex = zBase; badge.Parent = row
+    Instance.new("UICorner", badge).CornerRadius = UDim.new(0, 6)
+    local bs = Instance.new("UIStroke"); bs.Color = Theme.Accent; bs.Thickness = 1; bs.Transparency = 0.45; bs.Parent = badge
+    local kLbl = Instance.new("TextLabel")
+    kLbl.Size = UDim2.new(1,0,1,0); kLbl.BackgroundTransparency = 1; kLbl.Text = keyLabel
+    kLbl.TextColor3 = Theme.Accent; kLbl.Font = Enum.Font.GothamBold; kLbl.TextSize = 12
+    kLbl.ZIndex = zBase+1; kLbl.Parent = badge
+    local dLbl = Instance.new("TextLabel")
+    dLbl.Size = UDim2.new(1,-48,1,0); dLbl.Position = UDim2.new(0,48,0,0); dLbl.BackgroundTransparency = 1
+    dLbl.Text = descText; dLbl.TextColor3 = Theme.TextMain; dLbl.Font = Enum.Font.GothamMedium
+    dLbl.TextSize = 12; dLbl.TextXAlignment = Enum.TextXAlignment.Left; dLbl.ZIndex = zBase+1; dLbl.Parent = row
+end
+
+local function createBullet(parent, icon, text, yPos, zBase)
+    local row = Instance.new("Frame")
+    row.Size = UDim2.new(1,-24,0,34); row.Position = UDim2.new(0,12,0,yPos)
+    row.BackgroundTransparency = 1; row.ZIndex = zBase; row.Parent = parent
+    local il = Instance.new("TextLabel")
+    il.Size = UDim2.new(0,22,1,0); il.BackgroundTransparency = 1; il.Text = icon
+    il.TextColor3 = Theme.Accent; il.Font = Enum.Font.GothamBold; il.TextSize = 14; il.ZIndex = zBase+1; il.Parent = row
+    local tl = Instance.new("TextLabel")
+    tl.Size = UDim2.new(1,-28,1,0); tl.Position = UDim2.new(0,26,0,0); tl.BackgroundTransparency = 1
+    tl.Text = text; tl.TextColor3 = Theme.TextDim; tl.Font = Enum.Font.Gotham; tl.TextSize = 11
+    tl.TextWrapped = true; tl.TextXAlignment = Enum.TextXAlignment.Left; tl.TextYAlignment = Enum.TextYAlignment.Center
+    tl.ZIndex = zBase+1; tl.Parent = row
+end
+
+local function createCard(parent, yPos, height, zBase)
+    local card = Instance.new("Frame")
+    card.Size = UDim2.new(1,-40,0,height); card.Position = UDim2.new(0,20,0,yPos)
+    card.BackgroundColor3 = Theme.KeybindBg; card.ZIndex = zBase; card.Parent = parent
+    Instance.new("UICorner", card).CornerRadius = UDim.new(0, 10)
+    local cs = Instance.new("UIStroke"); cs.Color = Theme.Stroke; cs.Thickness = 1; cs.Transparency = 0.5; cs.Parent = card
+    return card
+end
+
+local function createCardTitle(parent, text, zBase)
+    local lbl = Instance.new("TextLabel")
+    lbl.Size = UDim2.new(1,-16,0,20); lbl.Position = UDim2.new(0,12,0,6); lbl.BackgroundTransparency = 1
+    lbl.Text = text; lbl.TextColor3 = Theme.Accent; lbl.Font = Enum.Font.GothamBold; lbl.TextSize = 10
+    lbl.TextXAlignment = Enum.TextXAlignment.Left; lbl.ZIndex = zBase+1; lbl.Parent = parent
+end
+
+local function makePage(name)
+    local p = Instance.new("Frame")
+    p.Name = name; p.Size = UDim2.new(1,0,1,0); p.BackgroundTransparency = 1
+    p.ZIndex = 902; p.Visible = false; p.Parent = WarningFrame
+    return p
+end
+
+-- Page 1 — Keybinds
+local Page1 = makePage("Page1"); Page1.Visible = true
+local P1Title = Instance.new("TextLabel")
+P1Title.Size=UDim2.new(1,-100,0,22); P1Title.Position=UDim2.new(0,20,0,14); P1Title.BackgroundTransparency=1
+P1Title.Text="⚠  KEYBIND SETUP"; P1Title.TextColor3=Theme.Red; P1Title.Font=Enum.Font.GothamBlack
+P1Title.TextSize=17; P1Title.TextXAlignment=Enum.TextXAlignment.Left; P1Title.ZIndex=903; P1Title.Parent=Page1
+local P1Sub = Instance.new("TextLabel")
+P1Sub.Size=UDim2.new(1,-40,0,30); P1Sub.Position=UDim2.new(0,20,0,38); P1Sub.BackgroundTransparency=1
+P1Sub.Text="Set your hotbar exactly as shown below — the script reads these slots to equip tools automatically."
+P1Sub.TextColor3=Theme.TextDim; P1Sub.Font=Enum.Font.Gotham; P1Sub.TextSize=11; P1Sub.TextWrapped=true
+P1Sub.TextXAlignment=Enum.TextXAlignment.Left; P1Sub.ZIndex=903; P1Sub.Parent=Page1
+local P1Card1 = createCard(Page1, 74, 100, 902)
+createCardTitle(P1Card1, "FARMING SLOTS", 902)
+createKeyRow(P1Card1, "1", "PAN  —  Your digging / panning tool", 24, 903)
+local P1Card2 = createCard(Page1, 184, 120, 902)
+createCardTitle(P1Card2, "TOTEM SLOTS  (required for Auto Place Totem)", 902)
+createKeyRow(P1Card2, "4", "LUCK TOTEM", 24, 903)
+createKeyRow(P1Card2, "5", "STRENGTH TOTEM", 56, 903)
+createKeyRow(P1Card2, "6", "LUMINANT TOTEM", 88, 903)
+local P1Note = Instance.new("TextLabel")
+P1Note.Size=UDim2.new(1,-40,0,24); P1Note.Position=UDim2.new(0,20,0,314); P1Note.BackgroundTransparency=1
+P1Note.Text="💡 The script detects slots automatically via NewHotbarSlot — these are the recommended defaults."
+P1Note.TextColor3=Color3.fromRGB(80,80,100); P1Note.Font=Enum.Font.Gotham; P1Note.TextSize=10
+P1Note.TextWrapped=true; P1Note.TextXAlignment=Enum.TextXAlignment.Left; P1Note.ZIndex=903; P1Note.Parent=Page1
+
+-- Page 2 — Auto Totem
+local Page2 = makePage("Page2")
+local P2Title = Instance.new("TextLabel")
+P2Title.Size=UDim2.new(1,-100,0,22); P2Title.Position=UDim2.new(0,20,0,14); P2Title.BackgroundTransparency=1
+P2Title.Text="🗿  AUTO TOTEM SETUP"; P2Title.TextColor3=Theme.Accent; P2Title.Font=Enum.Font.GothamBlack
+P2Title.TextSize=17; P2Title.TextXAlignment=Enum.TextXAlignment.Left; P2Title.ZIndex=903; P2Title.Parent=Page2
+local P2Sub = Instance.new("TextLabel")
+P2Sub.Size=UDim2.new(1,-40,0,28); P2Sub.Position=UDim2.new(0,20,0,38); P2Sub.BackgroundTransparency=1
+P2Sub.Text="Auto Totem walks to your saved Totem Spot and places any missing totems. Follow these steps:"
+P2Sub.TextColor3=Theme.TextDim; P2Sub.Font=Enum.Font.Gotham; P2Sub.TextSize=11; P2Sub.TextWrapped=true
+P2Sub.TextXAlignment=Enum.TextXAlignment.Left; P2Sub.ZIndex=903; P2Sub.Parent=Page2
+local P2Card = createCard(Page2, 72, 195, 902)
+createCardTitle(P2Card, "HOW TO SET UP", 902)
+createBullet(P2Card,"①","Walk to the spot where you want totems placed — ideally near your Sand deposit.",22,903)
+createBullet(P2Card,"②","Open the SPOT PICKER section in the hub and press 🗿 Totem Spot to save your location.",56,903)
+createBullet(P2Card,"③","Make sure Luck, Strength and Luminant Totems are in hotbar slots 4, 5 and 6.",90,903)
+createBullet(P2Card,"④","Enable Auto Place Totem. The script checks every 90 seconds and replaces expired totems automatically.",126,903)
+createBullet(P2Card,"⑤","Enable Auto Shovel + Auto Pan & Shake alongside it for full hands-free farming.",160,903)
+local P2Note = Instance.new("TextLabel")
+P2Note.Size=UDim2.new(1,-40,0,36); P2Note.Position=UDim2.new(0,20,0,277); P2Note.BackgroundTransparency=1
+P2Note.Text="⚠  Totems will NOT be placed if you haven't saved a Totem Spot first. The script won't guess your location."
+P2Note.TextColor3=Theme.Red; P2Note.Font=Enum.Font.GothamMedium; P2Note.TextSize=10; P2Note.TextWrapped=true
+P2Note.TextXAlignment=Enum.TextXAlignment.Left; P2Note.ZIndex=903; P2Note.Parent=Page2
+
+-- Page 3 — Tips
+local Page3 = makePage("Page3")
+local P3Title = Instance.new("TextLabel")
+P3Title.Size=UDim2.new(1,-100,0,22); P3Title.Position=UDim2.new(0,20,0,14); P3Title.BackgroundTransparency=1
+P3Title.Text="💡  TIPS & NOTES"; P3Title.TextColor3=Theme.Accent; P3Title.Font=Enum.Font.GothamBlack
+P3Title.TextSize=17; P3Title.TextXAlignment=Enum.TextXAlignment.Left; P3Title.ZIndex=903; P3Title.Parent=Page3
+local P3CardA = createCard(Page3,44,155,902); createCardTitle(P3CardA,"AUTO SELL",902)
+createBullet(P3CardA,"→","Auto Sell triggers when your bag is full. It walks to the nearest merchant within 400 studs and sells all unlocked valuables.",22,903)
+createBullet(P3CardA,"→","Use Auto Lock (🔒 button) to protect specific items from being sold — locked items are never touched.",72,903)
+createBullet(P3CardA,"→","If no merchant is found within 400 studs a warning shows in the status bar and farming resumes.",122,903)
+local P3CardB = createCard(Page3,208,110,902); createCardTitle(P3CardB,"SPOT PICKER",902)
+createBullet(P3CardB,"→","Save a Sand Spot on land and a Water Spot in a river — Auto Manual Walk will walk between them automatically.",22,903)
+createBullet(P3CardB,"→","Spots are saved in memory only. Re-set them each session or use a Config to store your settings.",72,903)
+local P3CardC = createCard(Page3,326,60,902); createCardTitle(P3CardC,"CONFIGS",902)
+createBullet(P3CardC,"→","Save your current toggle states as a named config and set it to Autoload so everything restores on the next run.",22,903)
+
+-- Navigation
+local currentPage = 1
+local TOTAL_PAGES = 3
+local pages = {Page1, Page2, Page3}
+
+local function goToPage(n)
+    for i, pg in ipairs(pages) do pg.Visible = (i == n) end
+    for i, dot in ipairs(pageDots) do
+        TweenService:Create(dot, TweenInfo.new(0.2), {BackgroundColor3 = i==n and Theme.Accent or Color3.fromRGB(38,38,55)}):Play()
+    end
+    currentPage = n
+end
+
+local PrevBtn = Instance.new("TextButton")
+PrevBtn.Size=UDim2.new(0,80,0,38); PrevBtn.Position=UDim2.new(0,20,1,-52)
+PrevBtn.BackgroundColor3=Color3.fromRGB(22,22,34); PrevBtn.Text="← Back"; PrevBtn.TextColor3=Theme.TextDim
+PrevBtn.Font=Enum.Font.GothamBold; PrevBtn.TextSize=13; PrevBtn.AutoButtonColor=false
+PrevBtn.ZIndex=904; PrevBtn.Visible=false; PrevBtn.Parent=WarningFrame
+Instance.new("UICorner",PrevBtn).CornerRadius=UDim.new(0,9)
+local PrevStroke=Instance.new("UIStroke"); PrevStroke.Color=Theme.Stroke; PrevStroke.Thickness=1; PrevStroke.Parent=PrevBtn
+
+local NextBtn = Instance.new("TextButton")
+NextBtn.Size=UDim2.new(0,200,0,38); NextBtn.Position=UDim2.new(1,-220,1,-52)
+NextBtn.BackgroundColor3=Theme.Accent; NextBtn.Text="Next  →"; NextBtn.TextColor3=Color3.fromRGB(8,8,12)
+NextBtn.Font=Enum.Font.GothamBlack; NextBtn.TextSize=13; NextBtn.AutoButtonColor=false
+NextBtn.ZIndex=904; NextBtn.Parent=WarningFrame
+Instance.new("UICorner",NextBtn).CornerRadius=UDim.new(0,9)
+NextBtn.MouseEnter:Connect(function() TweenService:Create(NextBtn,TweenInfo.new(0.15),{BackgroundColor3=Color3.fromRGB(0,255,175)}):Play() end)
+NextBtn.MouseLeave:Connect(function() TweenService:Create(NextBtn,TweenInfo.new(0.15),{BackgroundColor3=Theme.Accent}):Play() end)
+PrevBtn.MouseEnter:Connect(function()
+    TweenService:Create(PrevStroke,TweenInfo.new(0.15),{Color=Theme.Accent,Transparency=0.3}):Play()
+    TweenService:Create(PrevBtn,TweenInfo.new(0.15),{TextColor3=Theme.Accent}):Play()
+end)
+PrevBtn.MouseLeave:Connect(function()
+    TweenService:Create(PrevStroke,TweenInfo.new(0.15),{Color=Theme.Stroke,Transparency=0}):Play()
+    TweenService:Create(PrevBtn,TweenInfo.new(0.15),{TextColor3=Theme.TextDim}):Play()
+end)
+
+PrevBtn.MouseButton1Click:Connect(function()
+    if currentPage > 1 then
+        goToPage(currentPage - 1)
+        PrevBtn.Visible = currentPage > 1
+        NextBtn.Text    = currentPage == TOTAL_PAGES and "Start Farming  ✓" or "Next  →"
+    end
+end)
+
+NextBtn.MouseButton1Click:Connect(function()
+    if currentPage < TOTAL_PAGES then
+        goToPage(currentPage + 1)
+        PrevBtn.Visible = true
+        NextBtn.Text    = currentPage == TOTAL_PAGES and "Start Farming  ✓" or "Next  →"
+    else
+        TweenService:Create(WarningDimmer,TweenInfo.new(0.5),{BackgroundTransparency=1}):Play()
+        TweenService:Create(WarningFrame,TweenInfo.new(0.4,Enum.EasingStyle.Back,Enum.EasingDirection.In),{Size=UDim2.new(0,0,0,0)}):Play()
+        task.wait(0.4)
+        WarningDimmer.Visible = false
+        WarningFrame.Visible  = false
+        local MF = ScreenGui:FindFirstChild("MainFrame")
+        if MF then
+            MF.Visible = true
+            MF.Size    = UDim2.new(0,0,0,0)
+            TweenService:Create(MF,TweenInfo.new(0.45,Enum.EasingStyle.Back,Enum.EasingDirection.Out),{Size=UDim2.new(0,360,0,550)}):Play()
+        end
+    end
+end)
+
+-- Show setup guide immediately on load
+task.spawn(function()
+    task.wait(0.3)
+    local MF = ScreenGui:FindFirstChild("MainFrame")
+    if MF then MF.Visible = true end
+    TweenService:Create(WarningDimmer,TweenInfo.new(0.5),{BackgroundTransparency=0.25}):Play()
+    TweenService:Create(WarningFrame,TweenInfo.new(0.55,Enum.EasingStyle.Back,Enum.EasingDirection.Out),{Size=UDim2.new(0,420,0,400)}):Play()
+end)
+
+-- ==========================================
+--   PATCH NOTES / CHANGELOG
+-- ==========================================
+local ChangelogDimmer = Instance.new("Frame")
+ChangelogDimmer.Name="ChangelogDimmer"; ChangelogDimmer.Size=UDim2.new(1,0,1,0)
+ChangelogDimmer.BackgroundColor3=Color3.new(0,0,0); ChangelogDimmer.BackgroundTransparency=1
+ChangelogDimmer.ZIndex=800; ChangelogDimmer.Visible=false; ChangelogDimmer.Parent=ScreenGui
+
+local ChangelogFrame = Instance.new("Frame")
+ChangelogFrame.Name="ChangelogFrame"; ChangelogFrame.Size=UDim2.new(0,420,0,490)
+ChangelogFrame.Position=UDim2.new(0.5,0,0.5,0); ChangelogFrame.AnchorPoint=Vector2.new(0.5,0.5)
+ChangelogFrame.BackgroundColor3=Color3.fromRGB(11,11,18); ChangelogFrame.ClipsDescendants=true
+ChangelogFrame.ZIndex=801; ChangelogFrame.Visible=false; ChangelogFrame.Parent=ScreenGui
+Instance.new("UICorner",ChangelogFrame).CornerRadius=UDim.new(0,18)
+local CLStroke=Instance.new("UIStroke"); CLStroke.Color=Theme.Accent; CLStroke.Thickness=1; CLStroke.Transparency=0.35; CLStroke.Parent=ChangelogFrame
+
+local CLBar=Instance.new("Frame"); CLBar.Size=UDim2.new(1,0,0,3); CLBar.BackgroundColor3=Theme.Accent
+CLBar.BorderSizePixel=0; CLBar.ZIndex=802; CLBar.Parent=ChangelogFrame
+local CLBarGrad=Instance.new("UIGradient")
+CLBarGrad.Color=ColorSequence.new({ColorSequenceKeypoint.new(0,Color3.new(0,0,0)),ColorSequenceKeypoint.new(0.3,Theme.Accent),ColorSequenceKeypoint.new(0.7,Theme.Accent),ColorSequenceKeypoint.new(1,Color3.new(0,0,0))})
+CLBarGrad.Parent=CLBar
+
+local CLTitle=Instance.new("TextLabel")
+CLTitle.Size=UDim2.new(1,-60,0,22); CLTitle.Position=UDim2.new(0,18,0,14); CLTitle.BackgroundTransparency=1
+CLTitle.Text="📋  PATCH NOTES"; CLTitle.TextColor3=Theme.TextMain; CLTitle.Font=Enum.Font.GothamBlack
+CLTitle.TextSize=16; CLTitle.TextXAlignment=Enum.TextXAlignment.Left; CLTitle.ZIndex=803; CLTitle.Parent=ChangelogFrame
+
+local CLClose=Instance.new("TextButton")
+CLClose.Size=UDim2.new(0,28,0,28); CLClose.Position=UDim2.new(1,-40,0,10)
+CLClose.BackgroundColor3=Color3.fromRGB(40,20,25); CLClose.Text="✕"; CLClose.TextColor3=Theme.Red
+CLClose.Font=Enum.Font.GothamBold; CLClose.TextSize=12; CLClose.AutoButtonColor=false; CLClose.ZIndex=803; CLClose.Parent=ChangelogFrame
+Instance.new("UICorner",CLClose).CornerRadius=UDim.new(1,0)
+CLClose.MouseButton1Click:Connect(function()
+    TweenService:Create(ChangelogDimmer,TweenInfo.new(0.3),{BackgroundTransparency=1}):Play()
+    TweenService:Create(ChangelogFrame,TweenInfo.new(0.3,Enum.EasingStyle.Back,Enum.EasingDirection.In),{Size=UDim2.new(0,0,0,0)}):Play()
+    task.wait(0.35); ChangelogDimmer.Visible=false; ChangelogFrame.Visible=false
+    ChangelogFrame.Size=UDim2.new(0,420,0,490)
+end)
+
+local CLScroll=Instance.new("ScrollingFrame")
+CLScroll.Size=UDim2.new(1,-20,1,-54); CLScroll.Position=UDim2.new(0,10,0,48)
+CLScroll.BackgroundTransparency=1; CLScroll.ScrollBarThickness=3; CLScroll.ScrollBarImageColor3=Theme.Accent
+CLScroll.ScrollingDirection=Enum.ScrollingDirection.Y; CLScroll.CanvasSize=UDim2.new(0,0,0,0)
+CLScroll.ZIndex=802; CLScroll.Parent=ChangelogFrame
+local CLLayout=Instance.new("UIListLayout"); CLLayout.SortOrder=Enum.SortOrder.LayoutOrder; CLLayout.Padding=UDim.new(0,10); CLLayout.Parent=CLScroll
+local CLPad=Instance.new("UIPadding"); CLPad.PaddingLeft=UDim.new(0,6); CLPad.PaddingRight=UDim.new(0,6); CLPad.PaddingTop=UDim.new(0,4); CLPad.Parent=CLScroll
+
+local function addVersionBlock(version, date, isLatest, entries, layoutOrder)
+    local blockHeight = 22 + 6 + (#entries * 34) + 20
+    local block=Instance.new("Frame"); block.Size=UDim2.new(1,0,0,blockHeight)
+    block.BackgroundColor3=Color3.fromRGB(14,14,22); block.ZIndex=803; block.LayoutOrder=layoutOrder; block.Parent=CLScroll
+    Instance.new("UICorner",block).CornerRadius=UDim.new(0,10)
+    local bStroke=Instance.new("UIStroke"); bStroke.Color=isLatest and Theme.Accent or Theme.Stroke
+    bStroke.Thickness=1; bStroke.Transparency=isLatest and 0.3 or 0.75; bStroke.Parent=block
+    local innerPad=Instance.new("UIPadding"); innerPad.PaddingLeft=UDim.new(0,12); innerPad.PaddingRight=UDim.new(0,12)
+    innerPad.PaddingTop=UDim.new(0,10); innerPad.PaddingBottom=UDim.new(0,10); innerPad.Parent=block
+    local innerLayout=Instance.new("UIListLayout"); innerLayout.SortOrder=Enum.SortOrder.LayoutOrder; innerLayout.Padding=UDim.new(0,4); innerLayout.Parent=block
+    local headerRow=Instance.new("Frame"); headerRow.Size=UDim2.new(1,0,0,22); headerRow.BackgroundTransparency=1; headerRow.LayoutOrder=0; headerRow.ZIndex=804; headerRow.Parent=block
+    local verLbl=Instance.new("TextLabel"); verLbl.Size=UDim2.new(0.6,0,1,0); verLbl.BackgroundTransparency=1; verLbl.Text=version
+    verLbl.TextColor3=isLatest and Theme.Accent or Theme.TextMain; verLbl.Font=Enum.Font.GothamBlack; verLbl.TextSize=13
+    verLbl.TextXAlignment=Enum.TextXAlignment.Left; verLbl.ZIndex=804; verLbl.Parent=headerRow
+    if isLatest then
+        local nb=Instance.new("TextLabel"); nb.Size=UDim2.new(0,44,0,16); nb.Position=UDim2.new(0,110,0.5,-8)
+        nb.BackgroundColor3=Color3.fromRGB(0,60,40); nb.Text="LATEST"; nb.TextColor3=Theme.Accent
+        nb.Font=Enum.Font.GothamBold; nb.TextSize=9; nb.ZIndex=805; nb.Parent=headerRow
+        Instance.new("UICorner",nb).CornerRadius=UDim.new(0,4)
+    end
+    local dateLbl=Instance.new("TextLabel"); dateLbl.Size=UDim2.new(0.4,0,1,0); dateLbl.Position=UDim2.new(0.6,0,0,0)
+    dateLbl.BackgroundTransparency=1; dateLbl.Text=date; dateLbl.TextColor3=Theme.TextDim; dateLbl.Font=Enum.Font.Gotham
+    dateLbl.TextSize=10; dateLbl.TextXAlignment=Enum.TextXAlignment.Right; dateLbl.ZIndex=804; dateLbl.Parent=headerRow
+    local div=Instance.new("Frame"); div.Size=UDim2.new(1,0,0,1); div.BackgroundColor3=isLatest and Theme.Accent or Theme.Stroke
+    div.BackgroundTransparency=isLatest and 0.6 or 0.8; div.BorderSizePixel=0; div.LayoutOrder=1; div.ZIndex=803; div.Parent=block
+    local tagColors={["NEW"]=Color3.fromRGB(0,200,130),["FIX"]=Color3.fromRGB(255,160,50),["REMOVED"]=Color3.fromRGB(255,70,80),["IMPROVED"]=Color3.fromRGB(100,180,255),["INFO"]=Color3.fromRGB(160,160,190)}
+    for i, entry in ipairs(entries) do
+        local tag,text=entry[1],entry[2]
+        local row=Instance.new("Frame"); row.Size=UDim2.new(1,0,0,30); row.BackgroundTransparency=1; row.LayoutOrder=i+1; row.ZIndex=804; row.Parent=block
+        local tl=Instance.new("TextLabel"); tl.Size=UDim2.new(0,66,0,18); tl.BackgroundColor3=Color3.fromRGB(16,16,26)
+        tl.Text=tag; tl.TextColor3=tagColors[tag] or Theme.TextDim; tl.Font=Enum.Font.GothamBold; tl.TextSize=9; tl.ZIndex=805; tl.Parent=row
+        Instance.new("UICorner",tl).CornerRadius=UDim.new(0,4)
+        local el=Instance.new("TextLabel"); el.Size=UDim2.new(1,-76,0,28); el.Position=UDim2.new(0,74,0,1)
+        el.BackgroundTransparency=1; el.Text=text; el.TextColor3=Theme.TextDim; el.Font=Enum.Font.Gotham; el.TextSize=11
+        el.TextWrapped=true; el.TextXAlignment=Enum.TextXAlignment.Left; el.TextYAlignment=Enum.TextYAlignment.Top; el.ZIndex=804; el.Parent=row
+    end
+end
+
+addVersionBlock("Version 2.0 — Remastered+","Mar 2026",true,{
+    {"NEW","3-page setup guide on first launch — Keybinds, Auto Totem walkthrough, and General Tips"},
+    {"NEW","Auto Totem setup page with step-by-step instructions"},
+    {"NEW","Tips & Notes page covering Auto Sell range, Auto Lock, Spot Picker usage, and Configs/Autoload"},
+    {"NEW","Verification split into separate loader — main hub loads via loadstring after key passes"},
+    {"IMPROVED","Setup guide uses page dot indicators and Back / Next / Start Farming navigation buttons"},
+    {"IMPROVED","WarningFrame accent stroke changed from red to Accent green"},
+    {"IMPROVED","Changelog button (📋) added to the main title bar"},
+    {"REMOVED","Old single-screen keybind warning replaced by 3-page guide"},
+},1)
+
+addVersionBlock("Version 1.0 — Remastered","Early 2026",false,{
+    {"NEW","Key system — Work.ink token required, auto-expiry watchdog"},
+    {"NEW","Full UI remaster — dark glass theme, animated section labels, glowing toggles"},
+    {"NEW","Auto Sell completely rewritten — walks to a safe distance in front of merchant"},
+    {"NEW","Auto Manual Walk — fill-state-locked reliable walking system"},
+    {"NEW","Configs — Save / Load / Overwrite / Set-AutoLoad"},
+    {"NEW","Unselect All and Lock Visible buttons added to the Auto Lock filter"},
+    {"IMPROVED","Totem system — radius detection, stays inside totem range, smarter pathing"},
+    {"REMOVED","Auto Walk — replaced by Auto Manual Walk"},
+    {"FIX","Fixed numerous bugs across all automation systems"},
+},2)
+
+-- Tooltip
+local TooltipFrame=Instance.new("Frame")
+TooltipFrame.Name="Tooltip"; TooltipFrame.Size=UDim2.new(0,210,0,0)
+TooltipFrame.BackgroundColor3=Color3.fromRGB(16,14,22); TooltipFrame.BorderSizePixel=0
+TooltipFrame.Visible=false; TooltipFrame.ZIndex=100; TooltipFrame.Parent=ScreenGui
+Instance.new("UICorner",TooltipFrame).CornerRadius=UDim.new(0,8)
+local TtStroke=Instance.new("UIStroke"); TtStroke.Color=Theme.Accent; TtStroke.Thickness=1; TtStroke.Transparency=0.6; TtStroke.Parent=TooltipFrame
+local TooltipLabel=Instance.new("TextLabel")
+TooltipLabel.Size=UDim2.new(1,-16,1,-12); TooltipLabel.Position=UDim2.new(0,8,0,6); TooltipLabel.BackgroundTransparency=1
+TooltipLabel.TextColor3=Theme.TextDim; TooltipLabel.Font=Enum.Font.Gotham; TooltipLabel.TextSize=12
+TooltipLabel.TextWrapped=true; TooltipLabel.TextXAlignment=Enum.TextXAlignment.Left; TooltipLabel.TextYAlignment=Enum.TextYAlignment.Top
+TooltipLabel.ZIndex=101; TooltipLabel.Parent=TooltipFrame
+
+local function ShowTooltip(text,x,y)
+    TooltipLabel.Text=text
+    local bounds=game:GetService("TextService"):GetTextSize(text,12,Enum.Font.Gotham,Vector2.new(190,1000))
+    TooltipFrame.Size=UDim2.new(0,200,0,bounds.Y+16)
+    TooltipFrame.Position=UDim2.new(0,x+15,0,y)
+    TooltipFrame.Visible=true
+end
+local function HideTooltip() TooltipFrame.Visible=false end
+
+-- Main frame
+local MainFrame=Instance.new("Frame")
+MainFrame.Name="MainFrame"; MainFrame.Size=UDim2.new(0,360,0,550)
+MainFrame.Position=UDim2.new(0.5,-180,0.5,-295); MainFrame.BackgroundColor3=Theme.Bg
+MainFrame.Visible=false; MainFrame.Parent=ScreenGui
+Instance.new("UICorner",MainFrame).CornerRadius=UDim.new(0,16)
+local MainStroke=Instance.new("UIStroke"); MainStroke.Color=Theme.Stroke; MainStroke.Thickness=1; MainStroke.Parent=MainFrame
+
+-- Header
+local TitleBar=Instance.new("Frame"); TitleBar.Size=UDim2.new(1,0,0,52); TitleBar.BackgroundColor3=Theme.Header; TitleBar.Parent=MainFrame
+Instance.new("UICorner",TitleBar).CornerRadius=UDim.new(0,16)
+local TitleFix=Instance.new("Frame"); TitleFix.Size=UDim2.new(1,0,0,16); TitleFix.Position=UDim2.new(0,0,1,-16); TitleFix.BackgroundColor3=Theme.Header; TitleFix.BorderSizePixel=0; TitleFix.Parent=TitleBar
+local HeaderLine=Instance.new("Frame"); HeaderLine.Size=UDim2.new(1,0,0,1); HeaderLine.Position=UDim2.new(0,0,1,-1); HeaderLine.BackgroundColor3=Theme.Accent; HeaderLine.BorderSizePixel=0; HeaderLine.Parent=TitleBar
+local HLGrad=Instance.new("UIGradient")
+HLGrad.Color=ColorSequence.new({ColorSequenceKeypoint.new(0,Color3.fromRGB(0,0,0)),ColorSequenceKeypoint.new(0.2,Theme.Accent),ColorSequenceKeypoint.new(0.8,Theme.Accent),ColorSequenceKeypoint.new(1,Color3.fromRGB(0,0,0))})
+HLGrad.Transparency=NumberSequence.new(0.2); HLGrad.Parent=HeaderLine
+
+local SigmaBadge=Instance.new("Frame"); SigmaBadge.Size=UDim2.new(0,32,0,32); SigmaBadge.Position=UDim2.new(0,14,0.5,-16)
+SigmaBadge.BackgroundColor3=Color3.fromRGB(0,35,26); SigmaBadge.ZIndex=2; SigmaBadge.Parent=TitleBar
+Instance.new("UICorner",SigmaBadge).CornerRadius=UDim.new(0,8)
+local SBStroke=Instance.new("UIStroke"); SBStroke.Color=Theme.Accent; SBStroke.Thickness=1; SBStroke.Transparency=0.4; SBStroke.Parent=SigmaBadge
+local SigmaLetter=Instance.new("TextLabel"); SigmaLetter.Size=UDim2.new(1,0,1,0); SigmaLetter.BackgroundTransparency=1
+SigmaLetter.Text="Σ"; SigmaLetter.TextColor3=Theme.Accent; SigmaLetter.Font=Enum.Font.GothamBlack; SigmaLetter.TextSize=18; SigmaLetter.ZIndex=3; SigmaLetter.Parent=SigmaBadge
+
+local TitleLabel=Instance.new("TextLabel"); TitleLabel.Size=UDim2.new(1,-115,0,20); TitleLabel.Position=UDim2.new(0,56,0,10)
+TitleLabel.BackgroundTransparency=1; TitleLabel.Text="SIGMA HUB"; TitleLabel.TextColor3=Theme.TextMain
+TitleLabel.Font=Enum.Font.GothamBlack; TitleLabel.TextSize=16; TitleLabel.TextXAlignment=Enum.TextXAlignment.Left; TitleLabel.Parent=TitleBar
+
+local SubLabel=Instance.new("TextLabel"); SubLabel.Size=UDim2.new(1,-115,0,14); SubLabel.Position=UDim2.new(0,56,0,30)
+SubLabel.BackgroundTransparency=1; SubLabel.Text="REMASTERED"; SubLabel.TextColor3=Theme.Accent
+SubLabel.Font=Enum.Font.GothamBold; SubLabel.TextSize=10; SubLabel.TextXAlignment=Enum.TextXAlignment.Left; SubLabel.Parent=TitleBar
+
+local MinimizeBtn=Instance.new("TextButton"); MinimizeBtn.Size=UDim2.new(0,30,0,30); MinimizeBtn.Position=UDim2.new(1,-42,0.5,-15)
+MinimizeBtn.BackgroundColor3=Color3.fromRGB(30,28,40); MinimizeBtn.Text="—"; MinimizeBtn.TextColor3=Theme.TextDim
+MinimizeBtn.Font=Enum.Font.GothamBold; MinimizeBtn.TextSize=14; MinimizeBtn.AutoButtonColor=false; MinimizeBtn.Parent=TitleBar
+Instance.new("UICorner",MinimizeBtn).CornerRadius=UDim.new(1,0)
+MinimizeBtn.MouseEnter:Connect(function() TweenService:Create(MinimizeBtn,TweenInfo.new(0.15),{BackgroundColor3=Color3.fromRGB(45,40,60)}):Play() end)
+MinimizeBtn.MouseLeave:Connect(function() TweenService:Create(MinimizeBtn,TweenInfo.new(0.15),{BackgroundColor3=Color3.fromRGB(30,28,40)}):Play() end)
+MinimizeBtn.MouseButton1Click:Connect(function() MainFrame.Visible=false end)
+
+local ChangelogBtn=Instance.new("TextButton"); ChangelogBtn.Size=UDim2.new(0,30,0,30); ChangelogBtn.Position=UDim2.new(1,-78,0.5,-15)
+ChangelogBtn.BackgroundColor3=Color3.fromRGB(22,22,34); ChangelogBtn.Text="📋"; ChangelogBtn.TextColor3=Theme.TextDim
+ChangelogBtn.Font=Enum.Font.GothamBold; ChangelogBtn.TextSize=14; ChangelogBtn.AutoButtonColor=false; ChangelogBtn.ZIndex=2; ChangelogBtn.Parent=TitleBar
+Instance.new("UICorner",ChangelogBtn).CornerRadius=UDim.new(1,0)
+local CLBStroke=Instance.new("UIStroke"); CLBStroke.Color=Theme.Stroke; CLBStroke.Thickness=1; CLBStroke.Transparency=0.5; CLBStroke.Parent=ChangelogBtn
+ChangelogBtn.MouseEnter:Connect(function() TweenService:Create(CLBStroke,TweenInfo.new(0.15),{Color=Theme.Accent,Transparency=0.2}):Play() end)
+ChangelogBtn.MouseLeave:Connect(function() TweenService:Create(CLBStroke,TweenInfo.new(0.15),{Color=Theme.Stroke,Transparency=0.5}):Play() end)
+ChangelogBtn.MouseButton1Click:Connect(function()
+    if ChangelogFrame.Visible then
+        TweenService:Create(ChangelogDimmer,TweenInfo.new(0.3),{BackgroundTransparency=1}):Play()
+        TweenService:Create(ChangelogFrame,TweenInfo.new(0.3,Enum.EasingStyle.Back,Enum.EasingDirection.In),{Size=UDim2.new(0,0,0,0)}):Play()
+        task.wait(0.35); ChangelogDimmer.Visible=false; ChangelogFrame.Visible=false; ChangelogFrame.Size=UDim2.new(0,420,0,490)
+    else
+        CLScroll.CanvasSize=UDim2.new(0,0,0,900)
+        ChangelogDimmer.Visible=true; ChangelogFrame.Visible=true; ChangelogFrame.Size=UDim2.new(0,0,0,0)
+        TweenService:Create(ChangelogDimmer,TweenInfo.new(0.3),{BackgroundTransparency=0.45}):Play()
+        TweenService:Create(ChangelogFrame,TweenInfo.new(0.4,Enum.EasingStyle.Back,Enum.EasingDirection.Out),{Size=UDim2.new(0,420,0,490)}):Play()
+    end
+end)
+
+-- Drag
+local dragging,dragStart,startPos
+TitleBar.InputBegan:Connect(function(input)
+    if input.UserInputType==Enum.UserInputType.MouseButton1 or input.UserInputType==Enum.UserInputType.Touch then
+        dragging=true; dragStart=input.Position; startPos=MainFrame.Position
+        input.Changed:Connect(function() if input.UserInputState==Enum.UserInputState.End then dragging=false end end)
+    end
+end)
+TitleBar.InputChanged:Connect(function(input)
+    if dragging and (input.UserInputType==Enum.UserInputType.MouseMovement or input.UserInputType==Enum.UserInputType.Touch) then
+        local delta=input.Position-dragStart
+        MainFrame.Position=UDim2.new(startPos.X.Scale,startPos.X.Offset+delta.X,startPos.Y.Scale,startPos.Y.Offset+delta.Y)
+    end
+end)
+
+-- Scrollable container
+local Container=Instance.new("ScrollingFrame")
+Container.Size=UDim2.new(1,-24,1,-160); Container.Position=UDim2.new(0,12,0,60)
+Container.CanvasSize=UDim2.new(0,0,0,700); Container.ScrollBarThickness=3; Container.ScrollBarImageColor3=Theme.Accent
+Container.ScrollingDirection=Enum.ScrollingDirection.Y; Container.BackgroundTransparency=1; Container.Parent=MainFrame
+Container.VerticalScrollBarInset=Enum.ScrollBarInset.ScrollBar
+local UIListLayout=Instance.new("UIListLayout"); UIListLayout.SortOrder=Enum.SortOrder.LayoutOrder; UIListLayout.Padding=UDim.new(0,6); UIListLayout.Parent=Container
+
+-- Status footer
+local StatusFrame=Instance.new("Frame"); StatusFrame.Size=UDim2.new(1,-24,0,96); StatusFrame.Position=UDim2.new(0,12,1,-108)
+StatusFrame.BackgroundColor3=Theme.StatusBg; StatusFrame.Parent=MainFrame
+Instance.new("UICorner",StatusFrame).CornerRadius=UDim.new(0,12)
+local StatusStroke=Instance.new("UIStroke"); StatusStroke.Color=Theme.Stroke; StatusStroke.Thickness=1; StatusStroke.Parent=StatusFrame
+
+local StatusAccentLine=Instance.new("Frame"); StatusAccentLine.Size=UDim2.new(1,0,0,2)
+StatusAccentLine.BackgroundColor3=Theme.Accent; StatusAccentLine.BorderSizePixel=0; StatusAccentLine.Parent=StatusFrame
+Instance.new("UICorner",StatusAccentLine).CornerRadius=UDim.new(0,12)
+local SAGrad=Instance.new("UIGradient")
+SAGrad.Color=ColorSequence.new({ColorSequenceKeypoint.new(0,Color3.new(0,0,0)),ColorSequenceKeypoint.new(0.25,Theme.Accent),ColorSequenceKeypoint.new(0.75,Theme.Accent),ColorSequenceKeypoint.new(1,Color3.new(0,0,0))})
+SAGrad.Transparency=NumberSequence.new({NumberSequenceKeypoint.new(0,0.3),NumberSequenceKeypoint.new(1,0.3)}); SAGrad.Parent=StatusAccentLine
+
+local StatusDot=Instance.new("Frame"); StatusDot.Size=UDim2.new(0,7,0,7); StatusDot.Position=UDim2.new(0,14,0,16)
+StatusDot.BackgroundColor3=Theme.Accent; StatusDot.Parent=StatusFrame
+Instance.new("UICorner",StatusDot).CornerRadius=UDim.new(1,0)
+task.spawn(function()
+    while StatusDot and StatusDot.Parent do
+        pcall(function() TweenService:Create(StatusDot,TweenInfo.new(1,Enum.EasingStyle.Sine,Enum.EasingDirection.InOut),{BackgroundTransparency=0.6}):Play() end)
+        task.wait(1)
+        if not (StatusDot and StatusDot.Parent) then break end
+        pcall(function() TweenService:Create(StatusDot,TweenInfo.new(1,Enum.EasingStyle.Sine,Enum.EasingDirection.InOut),{BackgroundTransparency=0}):Play() end)
+        task.wait(1)
+    end
+end)
+
+local StatusHeader=Instance.new("TextLabel"); StatusHeader.Text="STATUS"; StatusHeader.Font=Enum.Font.GothamBold; StatusHeader.TextSize=9
+StatusHeader.TextColor3=Theme.TextDim; StatusHeader.Size=UDim2.new(0.5,0,0,14); StatusHeader.Position=UDim2.new(0,28,0,10)
+StatusHeader.BackgroundTransparency=1; StatusHeader.TextXAlignment=Enum.TextXAlignment.Left; StatusHeader.Parent=StatusFrame
+
+local MainStatusLabel=Instance.new("TextLabel"); MainStatusLabel.Text="Idle"; MainStatusLabel.Font=Enum.Font.GothamBold; MainStatusLabel.TextSize=13
+MainStatusLabel.TextColor3=Theme.Accent; MainStatusLabel.Size=UDim2.new(1,-28,0,18); MainStatusLabel.Position=UDim2.new(0,14,0,26)
+MainStatusLabel.BackgroundTransparency=1; MainStatusLabel.TextXAlignment=Enum.TextXAlignment.Left; MainStatusLabel.Parent=StatusFrame
+
+local ProgressBg=Instance.new("Frame"); ProgressBg.Size=UDim2.new(1,-28,0,5); ProgressBg.Position=UDim2.new(0,14,0,52)
+ProgressBg.BackgroundColor3=Theme.ToggleOff; ProgressBg.Parent=StatusFrame
+Instance.new("UICorner",ProgressBg).CornerRadius=UDim.new(1,0)
+local ProgressBar=Instance.new("Frame"); ProgressBar.Size=UDim2.new(0,0,1,0); ProgressBar.BackgroundColor3=Theme.Accent; ProgressBar.Parent=ProgressBg
+Instance.new("UICorner",ProgressBar).CornerRadius=UDim.new(1,0)
+
+local FillPctLabel=Instance.new("TextLabel"); FillPctLabel.Text="0%"; FillPctLabel.Font=Enum.Font.GothamBold; FillPctLabel.TextSize=9
+FillPctLabel.TextColor3=Theme.Accent; FillPctLabel.Size=UDim2.new(1,-28,0,14); FillPctLabel.Position=UDim2.new(0,14,0,38)
+FillPctLabel.BackgroundTransparency=1; FillPctLabel.TextXAlignment=Enum.TextXAlignment.Right; FillPctLabel.Parent=StatusFrame
+
+local BagLabel=Instance.new("TextLabel"); BagLabel.Text="Bag: 0/0"; BagLabel.Font=Enum.Font.GothamMedium; BagLabel.TextSize=11
+BagLabel.TextColor3=Theme.TextDim; BagLabel.Size=UDim2.new(0.6,0,0,16); BagLabel.Position=UDim2.new(0,14,0,66)
+BagLabel.BackgroundTransparency=1; BagLabel.TextXAlignment=Enum.TextXAlignment.Left; BagLabel.Parent=StatusFrame
+
+local VerLabel=Instance.new("TextLabel"); VerLabel.Text="REMASTERED"; VerLabel.Font=Enum.Font.GothamBold; VerLabel.TextSize=9
+VerLabel.TextColor3=Color3.fromRGB(0,80,58); VerLabel.Size=UDim2.new(0.4,0,0,16); VerLabel.Position=UDim2.new(0.6,0,0,66)
+VerLabel.BackgroundTransparency=1; VerLabel.TextXAlignment=Enum.TextXAlignment.Right; VerLabel.Parent=StatusFrame
+
+-- // CONFIG FRAME //
+local ConfigFrame=Instance.new("Frame"); ConfigFrame.Name="ConfigFrame"; ConfigFrame.Size=UDim2.new(1,0,1,0)
+ConfigFrame.Position=UDim2.new(0,0,0,52); ConfigFrame.BackgroundColor3=Theme.Bg; ConfigFrame.Visible=false
+ConfigFrame.ZIndex=30; ConfigFrame.Parent=MainFrame
+Instance.new("UICorner",ConfigFrame).CornerRadius=UDim.new(0,16)
+
+local CfgTopBar=Instance.new("Frame"); CfgTopBar.Size=UDim2.new(1,-24,0,38); CfgTopBar.Position=UDim2.new(0,12,0,12)
+CfgTopBar.BackgroundColor3=Theme.Panel; CfgTopBar.ZIndex=31; CfgTopBar.Parent=ConfigFrame
+Instance.new("UICorner",CfgTopBar).CornerRadius=UDim.new(0,10)
+local CfgTitleLbl=Instance.new("TextLabel"); CfgTitleLbl.Size=UDim2.new(1,-50,1,0); CfgTitleLbl.Position=UDim2.new(0,14,0,0)
+CfgTitleLbl.BackgroundTransparency=1; CfgTitleLbl.Text="CONFIGS"; CfgTitleLbl.TextColor3=Theme.TextMain
+CfgTitleLbl.Font=Enum.Font.GothamBlack; CfgTitleLbl.TextSize=13; CfgTitleLbl.TextXAlignment=Enum.TextXAlignment.Left; CfgTitleLbl.ZIndex=32; CfgTitleLbl.Parent=CfgTopBar
+
+local CloseConfig=Instance.new("TextButton"); CloseConfig.Size=UDim2.new(0,26,0,26); CloseConfig.Position=UDim2.new(1,-32,0.5,-13)
+CloseConfig.BackgroundColor3=Color3.fromRGB(40,20,25); CloseConfig.Text="✕"; CloseConfig.TextColor3=Theme.Red
+CloseConfig.Font=Enum.Font.GothamBold; CloseConfig.TextSize=12; CloseConfig.AutoButtonColor=false; CloseConfig.ZIndex=32; CloseConfig.Parent=CfgTopBar
+Instance.new("UICorner",CloseConfig).CornerRadius=UDim.new(1,0)
+CloseConfig.MouseButton1Click:Connect(function() ConfigFrame.Visible=false end)
+
+local ConfigInput=Instance.new("TextBox"); ConfigInput.Size=UDim2.new(1,-110,0,34); ConfigInput.Position=UDim2.new(0,12,0,58)
+ConfigInput.BackgroundColor3=Theme.Panel; ConfigInput.PlaceholderText="Config name..."; ConfigInput.PlaceholderColor3=Theme.TextDim
+ConfigInput.Text=""; ConfigInput.TextColor3=Theme.TextMain; ConfigInput.Font=Enum.Font.Gotham; ConfigInput.TextSize=13
+ConfigInput.ZIndex=31; ConfigInput.Parent=ConfigFrame
+Instance.new("UICorner",ConfigInput).CornerRadius=UDim.new(0,8)
+local CIStroke=Instance.new("UIStroke"); CIStroke.Color=Theme.Stroke; CIStroke.Thickness=1; CIStroke.Parent=ConfigInput
+
+local SaveBtn=Instance.new("TextButton"); SaveBtn.Size=UDim2.new(0,84,0,34); SaveBtn.Position=UDim2.new(1,-96,0,58)
+SaveBtn.BackgroundColor3=Theme.Accent; SaveBtn.Text="+ Save"; SaveBtn.TextColor3=Color3.fromRGB(8,8,12)
+SaveBtn.Font=Enum.Font.GothamBold; SaveBtn.TextSize=13; SaveBtn.AutoButtonColor=false; SaveBtn.ZIndex=31; SaveBtn.Parent=ConfigFrame
+Instance.new("UICorner",SaveBtn).CornerRadius=UDim.new(0,8)
+SaveBtn.MouseEnter:Connect(function() TweenService:Create(SaveBtn,TweenInfo.new(0.15),{BackgroundColor3=Color3.fromRGB(0,255,175)}):Play() end)
+SaveBtn.MouseLeave:Connect(function() TweenService:Create(SaveBtn,TweenInfo.new(0.15),{BackgroundColor3=Theme.Accent}):Play() end)
+
+local ConfigInfoBtn=Instance.new("TextButton"); ConfigInfoBtn.Size=UDim2.new(0,18,0,18); ConfigInfoBtn.Position=UDim2.new(0,14,0,100)
+ConfigInfoBtn.BackgroundColor3=Theme.Panel; ConfigInfoBtn.Text="?"; ConfigInfoBtn.TextColor3=Theme.TextDim
+ConfigInfoBtn.Font=Enum.Font.GothamBold; ConfigInfoBtn.TextSize=11; ConfigInfoBtn.ZIndex=31; ConfigInfoBtn.Parent=ConfigFrame
+Instance.new("UICorner",ConfigInfoBtn).CornerRadius=UDim.new(1,0)
+ConfigInfoBtn.MouseEnter:Connect(function() ShowTooltip("Configs save your settings. 'Auto Place Totem' is saved too!",ConfigInfoBtn.AbsolutePosition.X,ConfigInfoBtn.AbsolutePosition.Y+22) end)
+ConfigInfoBtn.MouseLeave:Connect(function() HideTooltip() end)
+
+local ConfigList=Instance.new("ScrollingFrame"); ConfigList.Size=UDim2.new(1,-24,1,-148); ConfigList.Position=UDim2.new(0,12,0,120)
+ConfigList.BackgroundTransparency=1; ConfigList.ScrollBarThickness=3; ConfigList.ScrollBarImageColor3=Theme.Accent; ConfigList.ZIndex=31; ConfigList.Parent=ConfigFrame
+local CListLayout=Instance.new("UIListLayout"); CListLayout.SortOrder=Enum.SortOrder.LayoutOrder; CListLayout.Padding=UDim.new(0,5); CListLayout.Parent=ConfigList
+
+local function RefreshConfigs()
+    for _,c in pairs(ConfigList:GetChildren()) do if c:IsA("Frame") then c:Destroy() end end
+    local configs=GetConfigList(); local currentAuto=GetAutoload()
+    for _,name in pairs(configs) do
+        local Row=Instance.new("Frame"); Row.Size=UDim2.new(1,0,0,38); Row.BackgroundColor3=Theme.RowBg; Row.ZIndex=32; Row.Parent=ConfigList
+        Instance.new("UICorner",Row).CornerRadius=UDim.new(0,8)
+        local RStroke=Instance.new("UIStroke"); RStroke.Color=(name==currentAuto) and Theme.Accent or Theme.Stroke
+        RStroke.Thickness=1; RStroke.Transparency=(name==currentAuto) and 0.4 or 0.85; RStroke.Parent=Row
+        local NameLbl=Instance.new("TextLabel"); NameLbl.Text=name..(name==currentAuto and "  ✦" or "")
+        NameLbl.Size=UDim2.new(0.38,0,1,0); NameLbl.Position=UDim2.new(0,10,0,0); NameLbl.BackgroundTransparency=1
+        NameLbl.TextColor3=(name==currentAuto and Theme.Accent or Theme.TextMain); NameLbl.TextXAlignment=Enum.TextXAlignment.Left
+        NameLbl.Font=Enum.Font.GothamBold; NameLbl.TextSize=12; NameLbl.ZIndex=33; NameLbl.Parent=Row
+        local function makeBtn(label,bg,tc,xOff)
+            local b=Instance.new("TextButton"); b.Size=UDim2.new(0,44,0,26); b.Position=UDim2.new(1,xOff,0.5,-13)
+            b.BackgroundColor3=bg; b.Text=label; b.TextColor3=tc; b.Font=Enum.Font.GothamBold; b.TextSize=11
+            b.AutoButtonColor=false; b.ZIndex=33; b.Parent=Row; Instance.new("UICorner",b).CornerRadius=UDim.new(0,6); return b
+        end
+        local OverB=makeBtn("↑ Save",Color3.fromRGB(28,28,44),Theme.TextDim,-186)
+        OverB.MouseButton1Click:Connect(function() SaveConfig(name) end)
+        local LoadB=makeBtn("Load",Color3.fromRGB(16,38,28),Theme.Accent,-137)
+        LoadB.MouseButton1Click:Connect(function() LoadConfig(name) end)
+        local AutoB=makeBtn("Auto",(name==currentAuto and Theme.Accent or Color3.fromRGB(28,28,44)),(name==currentAuto and Color3.fromRGB(8,8,12) or Theme.TextDim),-88)
+        AutoB.MouseButton1Click:Connect(function()
+            if currentAuto==name then ClearAutoload() else SetAutoload(name) end
+            RefreshConfigs()
+        end)
+        local DelB=makeBtn("Del",Color3.fromRGB(38,14,18),Theme.Red,-39)
+        DelB.MouseButton1Click:Connect(function() DeleteConfig(name); RefreshConfigs() end)
+    end
+    ConfigList.CanvasSize=UDim2.new(0,0,0,CListLayout.AbsoluteContentSize.Y)
+end
+
+SaveBtn.MouseButton1Click:Connect(function()
+    local name=ConfigInput.Text
+    if name=="" then
+        local dt=os.date("*t")
+        name=string.format("Config_%02d%02d_%02d%02d",dt.month,dt.day,dt.hour,dt.min)
+    end
+    SaveConfig(name); ConfigInput.Text=""; RefreshConfigs()
+end)
+
+-- // FILTER FRAME //
+local FilterFrame=Instance.new("Frame"); FilterFrame.Name="FilterFrame"; FilterFrame.Size=UDim2.new(1,0,1,0)
+FilterFrame.Position=UDim2.new(0,0,0,52); FilterFrame.BackgroundColor3=Theme.Bg; FilterFrame.Visible=false
+FilterFrame.ZIndex=20; FilterFrame.Parent=MainFrame
+Instance.new("UICorner",FilterFrame).CornerRadius=UDim.new(0,16)
+
+local FltTopBar=Instance.new("Frame"); FltTopBar.Size=UDim2.new(1,-24,0,38); FltTopBar.Position=UDim2.new(0,12,0,12)
+FltTopBar.BackgroundColor3=Theme.Panel; FltTopBar.ZIndex=21; FltTopBar.Parent=FilterFrame
+Instance.new("UICorner",FltTopBar).CornerRadius=UDim.new(0,10)
+local FltTitle=Instance.new("TextLabel"); FltTitle.Size=UDim2.new(1,-50,1,0); FltTitle.Position=UDim2.new(0,14,0,0)
+FltTitle.BackgroundTransparency=1; FltTitle.Text="AUTO LOCK"; FltTitle.TextColor3=Theme.TextMain
+FltTitle.Font=Enum.Font.GothamBlack; FltTitle.TextSize=13; FltTitle.TextXAlignment=Enum.TextXAlignment.Left; FltTitle.ZIndex=22; FltTitle.Parent=FltTopBar
+
+local BackBtn=Instance.new("TextButton"); BackBtn.Size=UDim2.new(0,26,0,26); BackBtn.Position=UDim2.new(1,-32,0.5,-13)
+BackBtn.BackgroundColor3=Color3.fromRGB(40,20,25); BackBtn.Text="✕"; BackBtn.TextColor3=Theme.Red
+BackBtn.Font=Enum.Font.GothamBold; BackBtn.TextSize=12; BackBtn.AutoButtonColor=false; BackBtn.ZIndex=22; BackBtn.Parent=FltTopBar
+Instance.new("UICorner",BackBtn).CornerRadius=UDim.new(1,0)
+BackBtn.MouseButton1Click:Connect(function() FilterFrame.Visible=false end)
+
+local FilterSearch=Instance.new("TextBox"); FilterSearch.Size=UDim2.new(1,-24,0,34); FilterSearch.Position=UDim2.new(0,12,0,58)
+FilterSearch.BackgroundColor3=Theme.Panel; FilterSearch.PlaceholderText="🔍  Search items..."; FilterSearch.PlaceholderColor3=Theme.TextDim
+FilterSearch.Text=""; FilterSearch.TextColor3=Theme.TextMain; FilterSearch.Font=Enum.Font.Gotham; FilterSearch.TextSize=13
+FilterSearch.ZIndex=21; FilterSearch.Parent=FilterFrame
+Instance.new("UICorner",FilterSearch).CornerRadius=UDim.new(0,8)
+local FSStroke=Instance.new("UIStroke"); FSStroke.Color=Theme.Stroke; FSStroke.Thickness=1; FSStroke.Parent=FilterSearch
+
+local FilterList=Instance.new("ScrollingFrame"); FilterList.Size=UDim2.new(1,-24,1,-158); FilterList.Position=UDim2.new(0,12,0,100)
+FilterList.BackgroundTransparency=1; FilterList.ScrollBarThickness=3; FilterList.ScrollBarImageColor3=Theme.Accent
+FilterList.ZIndex=21; FilterList.VerticalScrollBarInset=Enum.ScrollBarInset.ScrollBar; FilterList.Parent=FilterFrame
+local FilterLayout=Instance.new("UIListLayout"); FilterLayout.SortOrder=Enum.SortOrder.Name; FilterLayout.Padding=UDim.new(0,4); FilterLayout.Parent=FilterList
+
+local function RefreshFilterList(searchText)
+    for _,c in pairs(FilterList:GetChildren()) do if c:IsA("Frame") then c:Destroy() end end
+    if not ValuablesFolder then pcall(function() ValuablesFolder=ReplicatedStorage:FindFirstChild("Items") and ReplicatedStorage.Items:FindFirstChild("Valuables") end) end
+    if not ValuablesFolder then return end
+    local items={}; for _,v in pairs(ValuablesFolder:GetChildren()) do table.insert(items,v.Name) end; table.sort(items)
+    for _,itemName in pairs(items) do
+        if not searchText or searchText=="" or string.find(string.lower(itemName),string.lower(searchText)) then
+            local locked=Config.LockedItems[itemName]
+            local ItemRow=Instance.new("Frame"); ItemRow.Size=UDim2.new(1,0,0,32)
+            ItemRow.BackgroundColor3=locked and Color3.fromRGB(14,30,22) or Theme.RowBg; ItemRow.ZIndex=25; ItemRow.Parent=FilterList
+            Instance.new("UICorner",ItemRow).CornerRadius=UDim.new(0,7)
+            local IStroke=Instance.new("UIStroke"); IStroke.Color=locked and Theme.Accent or Theme.Stroke
+            IStroke.Thickness=1; IStroke.Transparency=locked and 0.55 or 0.9; IStroke.Parent=ItemRow
+            local NameLabel=Instance.new("TextLabel"); NameLabel.Size=UDim2.new(1,-42,1,0); NameLabel.Position=UDim2.new(0,11,0,0)
+            NameLabel.BackgroundTransparency=1; NameLabel.Text=itemName
+            NameLabel.TextColor3=locked and Theme.Accent or Theme.TextMain; NameLabel.Font=Enum.Font.GothamMedium
+            NameLabel.TextSize=12; NameLabel.TextXAlignment=Enum.TextXAlignment.Left; NameLabel.ZIndex=26; NameLabel.Parent=ItemRow
+            local CheckBox=Instance.new("TextButton"); CheckBox.Size=UDim2.new(0,22,0,22); CheckBox.Position=UDim2.new(1,-30,0.5,-11)
+            CheckBox.BackgroundColor3=locked and Theme.Accent or Theme.ToggleOff
+            CheckBox.Text=locked and "✓" or ""; CheckBox.TextColor3=Color3.fromRGB(8,8,12)
+            CheckBox.Font=Enum.Font.GothamBlack; CheckBox.TextSize=12; CheckBox.AutoButtonColor=false; CheckBox.ZIndex=26; CheckBox.Parent=ItemRow
+            Instance.new("UICorner",CheckBox).CornerRadius=UDim.new(0,5)
+            CheckBox.MouseButton1Click:Connect(function()
+                if Config.LockedItems[itemName] then
+                    Config.LockedItems[itemName]=nil
+                    TweenService:Create(CheckBox,TweenInfo.new(0.15),{BackgroundColor3=Theme.ToggleOff}):Play(); CheckBox.Text=""
+                    TweenService:Create(ItemRow,TweenInfo.new(0.15),{BackgroundColor3=Theme.RowBg}):Play()
+                    IStroke.Color=Theme.Stroke; NameLabel.TextColor3=Theme.TextMain
+                else
+                    Config.LockedItems[itemName]=true
+                    TweenService:Create(CheckBox,TweenInfo.new(0.15),{BackgroundColor3=Theme.Accent}):Play(); CheckBox.Text="✓"
+                    TweenService:Create(ItemRow,TweenInfo.new(0.15),{BackgroundColor3=Color3.fromRGB(14,30,22)}):Play()
+                    IStroke.Color=Theme.Accent; NameLabel.TextColor3=Theme.Accent
+                end
+            end)
+        end
+    end
+    FilterList.CanvasSize=UDim2.new(0,0,0,FilterLayout.AbsoluteContentSize.Y)
+end
+RefreshFilterListRef=RefreshFilterList
+
+local FltBtnHolder=Instance.new("Frame"); FltBtnHolder.Size=UDim2.new(1,-24,0,32); FltBtnHolder.Position=UDim2.new(0,12,1,-44)
+FltBtnHolder.BackgroundTransparency=1; FltBtnHolder.ZIndex=22; FltBtnHolder.Parent=FilterFrame
+local FltBtnLayout=Instance.new("UIListLayout"); FltBtnLayout.FillDirection=Enum.FillDirection.Horizontal; FltBtnLayout.Padding=UDim.new(0,8); FltBtnLayout.Parent=FltBtnHolder
+
+local UnselectAllBtn=Instance.new("TextButton"); UnselectAllBtn.Size=UDim2.new(0.5,-4,1,0); UnselectAllBtn.BackgroundColor3=Theme.RowBg
+UnselectAllBtn.Text="Clear All"; UnselectAllBtn.TextColor3=Theme.TextDim; UnselectAllBtn.Font=Enum.Font.GothamBold; UnselectAllBtn.TextSize=12
+UnselectAllBtn.AutoButtonColor=false; UnselectAllBtn.ZIndex=22; UnselectAllBtn.Parent=FltBtnHolder
+Instance.new("UICorner",UnselectAllBtn).CornerRadius=UDim.new(0,7)
+UnselectAllBtn.MouseButton1Click:Connect(function() Config.LockedItems={}; RefreshFilterList(FilterSearch.Text) end)
+
+local SelectAllBtn=Instance.new("TextButton"); SelectAllBtn.Size=UDim2.new(0.5,-4,1,0); SelectAllBtn.BackgroundColor3=Color3.fromRGB(16,38,28)
+SelectAllBtn.Text="Lock Visible"; SelectAllBtn.TextColor3=Theme.Accent; SelectAllBtn.Font=Enum.Font.GothamBold; SelectAllBtn.TextSize=12
+SelectAllBtn.AutoButtonColor=false; SelectAllBtn.ZIndex=22; SelectAllBtn.Parent=FltBtnHolder
+Instance.new("UICorner",SelectAllBtn).CornerRadius=UDim.new(0,7)
+SelectAllBtn.MouseButton1Click:Connect(function()
+    for _,c in pairs(FilterList:GetChildren()) do
+        if c:IsA("Frame") then
+            local lbl=c:FindFirstChildOfClass("TextLabel")
+            if lbl then Config.LockedItems[lbl.Text]=true end
+        end
+    end
+    RefreshFilterList(FilterSearch.Text)
+end)
+FilterSearch:GetPropertyChangedSignal("Text"):Connect(function() RefreshFilterList(FilterSearch.Text) end)
+
+-- // UI HELPERS //
+local function CreateModernToggle(text,infoText,callback)
+    local Frame=Instance.new("Frame"); Frame.Size=UDim2.new(1,0,0,46); Frame.BackgroundColor3=Theme.Panel; Frame.Parent=Container
+    Instance.new("UICorner",Frame).CornerRadius=UDim.new(0,10)
+    local FrameStroke=Instance.new("UIStroke"); FrameStroke.Color=Theme.Stroke; FrameStroke.Thickness=1; FrameStroke.Transparency=0.7; FrameStroke.Parent=Frame
+    local Label=Instance.new("TextLabel"); Label.Size=UDim2.new(0.62,0,1,0); Label.Position=UDim2.new(0,14,0,0)
+    Label.BackgroundTransparency=1; Label.Text=text; Label.TextColor3=Theme.TextMain; Label.Font=Enum.Font.GothamMedium; Label.TextSize=13
+    Label.TextXAlignment=Enum.TextXAlignment.Left; Label.Parent=Frame
+    local InfoBtn=Instance.new("TextButton"); InfoBtn.Size=UDim2.new(0,16,0,16); InfoBtn.Position=UDim2.new(0,14,0.5,-8)
+    InfoBtn.BackgroundColor3=Color3.fromRGB(28,28,44); InfoBtn.Text="?"; InfoBtn.TextColor3=Theme.TextDim
+    InfoBtn.Font=Enum.Font.GothamBold; InfoBtn.TextSize=10; InfoBtn.AutoButtonColor=false; InfoBtn.ZIndex=2; InfoBtn.Parent=Frame
+    Instance.new("UICorner",InfoBtn).CornerRadius=UDim.new(1,0)
+    task.spawn(function()
+        task.wait()
+        local bounds=game:GetService("TextService"):GetTextSize(text,13,Enum.Font.GothamMedium,Vector2.new(200,50))
+        InfoBtn.Position=UDim2.new(0,14+bounds.X+7,0.5,-8)
+    end)
+    InfoBtn.MouseEnter:Connect(function() local p=InfoBtn.AbsolutePosition; ShowTooltip(infoText,p.X,p.Y+22) end)
+    InfoBtn.MouseLeave:Connect(function() HideTooltip() end)
+    local Switch=Instance.new("Frame"); Switch.Size=UDim2.new(0,44,0,22); Switch.Position=UDim2.new(1,-56,0.5,-11)
+    Switch.BackgroundColor3=Theme.ToggleOff; Switch.Parent=Frame
+    Instance.new("UICorner",Switch).CornerRadius=UDim.new(1,0)
+    local SwitchStroke=Instance.new("UIStroke"); SwitchStroke.Color=Theme.Stroke; SwitchStroke.Thickness=1; SwitchStroke.Transparency=0.5; SwitchStroke.Parent=Switch
+    local Knob=Instance.new("Frame"); Knob.Size=UDim2.new(0,16,0,16); Knob.Position=UDim2.new(0,3,0.5,-8)
+    Knob.BackgroundColor3=Theme.TextDim; Knob.ZIndex=2; Knob.Parent=Switch
+    Instance.new("UICorner",Knob).CornerRadius=UDim.new(1,0)
+    local Button=Instance.new("TextButton"); Button.Size=UDim2.new(1,0,1,0); Button.BackgroundTransparency=1; Button.Text=""; Button.ZIndex=3; Button.Parent=Switch
+    local isOn=false
+    local function SetState(state)
+        isOn=state
+        if isOn then
+            TweenService:Create(Switch,TweenInfo.new(0.22,Enum.EasingStyle.Quad),{BackgroundColor3=Theme.Accent}):Play()
+            TweenService:Create(Knob,TweenInfo.new(0.22,Enum.EasingStyle.Quad),{Position=UDim2.new(1,-19,0.5,-8),BackgroundColor3=Color3.fromRGB(8,8,12)}):Play()
+            TweenService:Create(FrameStroke,TweenInfo.new(0.22),{Color=Color3.fromRGB(0,100,70),Transparency=0.3}):Play()
+        else
+            TweenService:Create(Switch,TweenInfo.new(0.22,Enum.EasingStyle.Quad),{BackgroundColor3=Theme.ToggleOff}):Play()
+            TweenService:Create(Knob,TweenInfo.new(0.22,Enum.EasingStyle.Quad),{Position=UDim2.new(0,3,0.5,-8),BackgroundColor3=Theme.TextDim}):Play()
+            TweenService:Create(FrameStroke,TweenInfo.new(0.22),{Color=Theme.Stroke,Transparency=0.7}):Play()
+        end
+        callback(isOn)
+    end
+    ToggleUpdaters[text]=SetState
+    Button.MouseButton1Click:Connect(function() SetState(not isOn) end)
+end
+
+local function CreateActionButtons()
+    local Holder=Instance.new("Frame"); Holder.Size=UDim2.new(1,0,0,36); Holder.BackgroundTransparency=1; Holder.Parent=Container
+    local Layout=Instance.new("UIListLayout"); Layout.FillDirection=Enum.FillDirection.Horizontal; Layout.Padding=UDim.new(0,8); Layout.Parent=Holder
+    local function makeActionBtn(txt,tc,bg,strokeC,onClick)
+        local b=Instance.new("TextButton"); b.Size=UDim2.new(0.5,-4,1,0); b.BackgroundColor3=bg; b.Text=txt; b.TextColor3=tc
+        b.Font=Enum.Font.GothamBold; b.TextSize=13; b.AutoButtonColor=false; b.Parent=Holder
+        Instance.new("UICorner",b).CornerRadius=UDim.new(0,9)
+        local s=Instance.new("UIStroke"); s.Color=strokeC; s.Thickness=1; s.Transparency=0.55; s.Parent=b
+        b.MouseEnter:Connect(function() TweenService:Create(s,TweenInfo.new(0.15),{Transparency=0.1}):Play() end)
+        b.MouseLeave:Connect(function() TweenService:Create(s,TweenInfo.new(0.15),{Transparency=0.55}):Play() end)
+        b.MouseButton1Click:Connect(onClick); return b
+    end
+    makeActionBtn("🔒  Auto Lock",Theme.Accent,Color3.fromRGB(10,24,18),Theme.Accent,function()
+        RefreshFilterList(""); FilterFrame.Visible=true
+    end)
+    makeActionBtn("⚙  Configs",Color3.fromRGB(255,195,80),Color3.fromRGB(26,22,10),Color3.fromRGB(180,130,30),function()
+        RefreshConfigs(); ConfigFrame.Visible=true
+    end)
+end
+
+-- // 5. GAME FUNCTIONS //
+local function GetEquippedPan()
+    local Char=LocalPlayer.Character; if not Char then return nil end
+    local tool=Char:FindFirstChildOfClass("Tool"); if not tool then return nil end
+    local knownPans={["Metal Pan"]=true,["Silver Pan"]=true,["Golden Pan"]=true,["Diamond Pan"]=true,["Aurora Pan"]=true,["Magnetic Pan"]=true,["Dragonflame Pan"]=true,["Abyssal Pan"]=true,["Blightflow Pan"]=true,["Fossilized Pan"]=true}
+    if knownPans[tool.Name] and tool:FindFirstChild("Scripts") then return tool end
+    if not PansFolder then PansFolder=ReplicatedStorage:FindFirstChild("Items") and ReplicatedStorage.Items:FindFirstChild("Pans") end
+    if PansFolder and PansFolder:FindFirstChild(tool.Name) and tool:FindFirstChild("Scripts") then return tool end
+    if tool:FindFirstChild("Scripts") then
+        local s=tool.Scripts
+        if s:FindFirstChild("Pan") or s:FindFirstChild("Shake") or s:FindFirstChild("Collect") then return tool end
+    end
+    return nil
+end
+
+local function GetInventoryStatus()
+    local max=LocalPlayer:GetAttribute("InventorySize") or 500; local current=0
+    local backpack=LocalPlayer:FindFirstChild("BackpackTwo") or LocalPlayer:FindFirstChild("Backpack")
+    local itemsToCheck={}
+    if backpack then for _,v in pairs(backpack:GetChildren()) do table.insert(itemsToCheck,v) end end
+    if LocalPlayer.Character then for _,v in pairs(LocalPlayer.Character:GetChildren()) do if v:IsA("Tool") then table.insert(itemsToCheck,v) end end end
+    for _,item in pairs(itemsToCheck) do
+        local iType=item:GetAttribute("ItemType")
+        if iType=="Equipment" or iType=="Valuable" then current=current+1 end
+    end
+    return current, max
+end
+
+local function GetFillAmount(tool)
+    if tool then local a=tool:GetAttribute("Fill"); if a then return a end end
+    local Stats=LocalPlayer:FindFirstChild("Stats")
+    if Stats then
+        local s=Stats:GetAttribute("Sand") or Stats:GetAttribute("Fill"); if s then return s end
+        if Stats:FindFirstChild("Sand") then return Stats.Sand.Value end
+    end
+    return 0
+end
+
+local function GetCapacity(tool)
+    local Stats=LocalPlayer:FindFirstChild("Stats")
+    if Stats then local c=Stats:GetAttribute("Capacity"); if c then return c end end
+    return 100
+end
+
+local function GetStateLabel()
+    local pGui=LocalPlayer:FindFirstChild("PlayerGui"); if pGui then
+        local toolUI=pGui:FindFirstChild("ToolUI"); if toolUI then
+            local controls=toolUI:FindFirstChild("Controls"); if controls then
+                local label=controls:FindFirstChildOfClass("TextLabel"); if label then return label.Text end
+            end
+        end
+    end
+    return "Unknown"
+end
+
+local function IsShakingActionActive()
+    if not Config.AutoShake then return false end
+    if Config.IsPanning then return true end
+    local PanTool=GetEquippedPan()
+    if PanTool then
+        local fill=GetFillAmount(PanTool); local state=GetStateLabel()
+        if fill>0 and state=="Pan" then return true end
+    end
+    return false
+end
+
+-- // 6. PATHFINDING & MOVEMENT //
+local function GetNearestMerchant()
+    local Char=LocalPlayer.Character; if not Char then return nil end
+    local Root=Char:FindFirstChild("HumanoidRootPart"); if not Root then return nil end
+    local closestDist=math.huge; local closestPos=nil
+    local validNames={Merchant=true,["Shady Merchant"]=true,Seller=true,Trader=true,["Traveling Merchant"]=true,["Shard Merchant"]=true,["Timelocked Merchant"]=true}
+    local function ScanFolder(folder)
+        for _,obj in pairs(folder:GetDescendants()) do
+            if obj:IsA("Model") and validNames[obj.Name] then
+                local hrp=obj:FindFirstChild("HumanoidRootPart") or obj:FindFirstChild("Torso") or obj.PrimaryPart
+                if hrp then
+                    local dist=(Root.Position-hrp.Position).Magnitude
+                    if dist<closestDist then closestDist=dist; closestPos=hrp.Position end
+                end
+            end
+        end
+    end
+    if workspace:FindFirstChild("NPCs") then ScanFolder(workspace.NPCs) end
+    if not closestPos then ScanFolder(workspace) end
+    return closestPos
+end
+
+local function CheckObstacle(Root)
+    local params=RaycastParams.new(); params.FilterDescendantsInstances={LocalPlayer.Character}; params.FilterType=Enum.RaycastFilterType.Exclude
+    local forward=Root.CFrame.LookVector; local pos=Root.Position
+    local kneePos=pos-Vector3.new(0,2.5,0); local kneeRay=workspace:Raycast(kneePos,forward*6,params)
+    local chestRay=workspace:Raycast(pos,forward*6,params)
+    if kneeRay and kneeRay.Instance.CanCollide then return "Jump"
+    elseif chestRay and chestRay.Instance.CanCollide then return "Blocked" end
+    return nil
+end
+
+local function SmartWalkTo(destination,stopCondition)
+    local Char=LocalPlayer.Character; if not Char then return end
+    local Humanoid=Char:FindFirstChild("Humanoid"); local Root=Char:FindFirstChild("HumanoidRootPart")
+    if not Humanoid or not Root then return end
+    if (Root.Position-destination).Magnitude<5 then Humanoid:MoveTo(destination); task.wait(0.5); return end
+    local path=PathfindingService:CreatePath({AgentRadius=3,AgentHeight=5,AgentCanJump=true,WaypointSpacing=3,Costs={Water=20,Rock=5,Slate=5,Basalt=5}})
+    local success,_=pcall(function() path:ComputeAsync(Root.Position,destination) end)
+    if success and path.Status==Enum.PathStatus.Success then
+        local waypoints=path:GetWaypoints(); local lastPosition=Root.Position
+        local stuckCount=0; local stuckFrames=0; local lastJumpTime=0
+        for i,waypoint in ipairs(waypoints) do
+            if not _G.SigmaFarm_Running then return end
+            if stopCondition and stopCondition() then Humanoid:MoveTo(Root.Position); return end
+            if waypoint.Action==Enum.PathWaypointAction.Jump then Humanoid.Jump=true end
+            Humanoid:MoveTo(waypoint.Position)
+            local timeout=tick()+5; local distanceThreshold=(i==#waypoints) and 3 or 4
+            local stuckCheckTime=tick()
+            while (Root.Position-waypoint.Position).Magnitude>distanceThreshold and tick()<timeout do
+                if stopCondition and stopCondition() then Humanoid:MoveTo(Root.Position); return end
+                if tick()-stuckCheckTime>0.15 then
+                    if (Root.Position-lastPosition).Magnitude<0.1 then stuckCount=stuckCount+1 else stuckCount=0; lastPosition=Root.Position end
+                    stuckCheckTime=tick()
+                end
+                local currentVel=Root.AssemblyLinearVelocity*Vector3.new(1,0,1)
+                if currentVel.Magnitude<2 then stuckFrames=stuckFrames+1 else stuckFrames=0 end
+                local obsType=CheckObstacle(Root)
+                if (obsType=="Jump" or obsType=="Blocked" or stuckFrames>8) and (tick()-lastJumpTime>0.5) then
+                    Humanoid.Jump=true; lastJumpTime=tick(); stuckFrames=0
+                    local dir=(waypoint.Position-Root.Position).Unit
+                    Humanoid:MoveTo(waypoint.Position+(dir*8)); task.wait(0.2); Humanoid:MoveTo(waypoint.Position)
+                end
+                if stuckCount>=5 then
+                    Humanoid.Jump=true; Humanoid:MoveTo(waypoint.Position); task.wait(0.2)
+                    if (Root.Position-lastPosition).Magnitude<0.1 then
+                        Humanoid:MoveTo(Root.Position+Vector3.new(math.random(-2,2),0,math.random(-2,2))); task.wait(0.2)
+                    end
+                    stuckCount=0
+                end
+                task.wait(0.05)
+            end
+        end
+    else
+        Humanoid:MoveTo(destination)
+        local timeout=tick()+10; local lastPos=Root.Position; local stuckCheckTime=tick(); local stuckCount=0; local stuckFrames=0; local lastJumpTime=0
+        while (Root.Position-destination).Magnitude>5 and tick()<timeout do
+            if stopCondition and stopCondition() then Humanoid:MoveTo(Root.Position); return end
+            if tick()-stuckCheckTime>0.15 then
+                if (Root.Position-lastPos).Magnitude<0.1 then stuckCount=stuckCount+1 else stuckCount=0; lastPos=Root.Position end
+                stuckCheckTime=tick()
+            end
+            local currentVel=Root.AssemblyLinearVelocity*Vector3.new(1,0,1)
+            if currentVel.Magnitude<2 then stuckFrames=stuckFrames+1 else stuckFrames=0 end
+            local obsType=CheckObstacle(Root)
+            if (obsType=="Jump" or obsType=="Blocked" or stuckFrames>8) and (tick()-lastJumpTime>0.5) then
+                Humanoid.Jump=true; lastJumpTime=tick(); stuckFrames=0
+            end
+            if stuckCount>=5 then Humanoid.Jump=true; Humanoid:MoveTo(destination); task.wait(0.2); stuckCount=0 end
+            task.wait(0.1)
+        end
+    end
+end
+
+local function SimpleWalkTo(position)
+    local Char=LocalPlayer.Character; if not Char then return end
+    local Hum=Char:FindFirstChild("Humanoid"); if not Hum then return end
+    if Hum.Sit then Hum.Sit=false end
+    Hum:MoveTo(position)
+end
+
+-- // 7. TOTEM & SURFACE LOGIC //
+local function GetTotemRadiusAndCenter(totemModel)
+    local mainPart=totemModel:FindFirstChild("MainPart"); if not mainPart then return nil end
+    local maxRadius=0
+    for i=1,4 do
+        local att=mainPart:FindFirstChild(tostring(i))
+        if att and att:IsA("Attachment") then
+            local r=(att.WorldPosition-mainPart.Position).Magnitude
+            if r>maxRadius then maxRadius=r end
+        end
+    end
+    if maxRadius<=0 then maxRadius=6 end
+    return maxRadius, mainPart.Position, mainPart
+end
+
+local function IsInTotemRadius(pos,totemModel)
+    local radius,center=GetTotemRadiusAndCenter(totemModel)
+    if not radius or not center then return false end
+    return (pos-center).Magnitude<=radius
+end
+
+local function GetNearbyTotems(playerPos,maxSearchDistance)
+    maxSearchDistance=maxSearchDistance or 80; local nearby={}
+    local activeTotems=workspace:FindFirstChild("ActiveTotems"); if not activeTotems then return nearby end
+    for _,totem in pairs(activeTotems:GetChildren()) do
+        if totem:IsA("Model") then
+            local name=totem.Name
+            if name:find("Luck") or name:find("Strength") or name:find("Luminant") then
+                local mainPart=totem:FindFirstChild("MainPart")
+                if mainPart and (playerPos-mainPart.Position).Magnitude<maxSearchDistance then
+                    table.insert(nearby,totem)
+                end
+            end
+        end
+    end
+    return nearby
+end
+
+local function CheckRegion(position)
+    if PointToRegion then
+        local regionName,_=PointToRegion.GetPanningRegion(position)
+        if regionName=="Water" then return "Water" end
+        if regionName=="Deposit" then return "Deposit" end
+        return nil
+    end
+    local region=Region3.new(position-Vector3.new(2,2,2),position+Vector3.new(2,2,2))
+    local success,material,_=pcall(function() return workspace.Terrain:ReadVoxels(region,4) end)
+    if success and material then
+        local mat=material[1][1][1]
+        if mat==Enum.Material.Water then return "Water"
+        elseif mat~=Enum.Material.Air and mat~=Enum.Material.Water then return "Deposit" end
+    end
+    return nil
+end
+
+local function GetSurfaceData(x,z)
+    local Char=LocalPlayer.Character; if not Char then return nil,nil end
+    local Root=Char:FindFirstChild("HumanoidRootPart"); if not Root then return nil,nil end
+    local origin=Root.Position+Vector3.new(x,10,z)
+    local params=RaycastParams.new(); params.FilterDescendantsInstances={Char}; params.FilterType=Enum.RaycastFilterType.Exclude; params.IgnoreWater=false
+    local result=workspace:Raycast(origin,Vector3.new(0,-60,0),params)
+    if result then return result.Position, result.Material end
+    return nil,nil
+end
+
+local function GetTotemContainingPosition(pos)
+    local activeTotems=workspace:FindFirstChild("ActiveTotems"); if not activeTotems then return nil end
+    for _,totem in pairs(activeTotems:GetChildren()) do
+        if totem:IsA("Model") and IsInTotemRadius(pos,totem) then return totem end
+    end
+    return nil
+end
+
+local function GetSpecificTotem(pos,totemType)
+    local activeTotems=workspace:FindFirstChild("ActiveTotems"); if not activeTotems then return nil end
+    for _,totem in pairs(activeTotems:GetChildren()) do
+        if totem:IsA("Model") and totem.Name:find(totemType) and IsInTotemRadius(pos,totem) then return totem end
+    end
+    return nil
+end
+
+local function FindNearestTarget(targetType)
+    local Char=LocalPlayer.Character; if not Char then return nil end
+    local Root=Char:FindFirstChild("HumanoidRootPart"); if not Root then return nil end
+    local center=Root.Position
+    local currentTotem=GetTotemContainingPosition(center); local nearbyTotems=GetNearbyTotems(center,80)
+    local bestPos=nil; local bestDist=9999; local bestTotemPos=nil; local bestTotemDist=9999
+    for x=-30,30,6 do for z=-30,30,6 do
+        local surfPos,surfMat=GetSurfaceData(x,z)
+        if surfPos then
+            local physicallyValid=false
+            if targetType=="Water" and surfMat==Enum.Material.Water then physicallyValid=true
+            elseif targetType=="Deposit" and surfMat~=Enum.Material.Water and surfMat~=Enum.Material.Air then physicallyValid=true end
+            if physicallyValid then
+                local regionType=CheckRegion(surfPos)
+                if not regionType and targetType=="Water" and surfMat==Enum.Material.Water then regionType="Water" end
+                if regionType==targetType then
+                    local dist=(center-surfPos).Magnitude
+                    if currentTotem then
+                        if IsInTotemRadius(surfPos,currentTotem) and dist<bestTotemDist then bestTotemDist=dist; bestTotemPos=surfPos end
+                    else
+                        local isInsideAnyTotem=false
+                        for _,totem in pairs(nearbyTotems) do if IsInTotemRadius(surfPos,totem) then isInsideAnyTotem=true; break end end
+                        if isInsideAnyTotem then
+                            if dist<bestTotemDist then bestTotemDist=dist; bestTotemPos=surfPos end
+                        elseif dist<bestDist then bestDist=dist; bestPos=surfPos end
+                    end
+                end
+            end
+        end
+    end end
+    if currentTotem and not bestTotemPos then
+        local radius,centerPos=GetTotemRadiusAndCenter(currentTotem)
+        if radius and centerPos then
+            local dir=(center-centerPos)
+            local fallback=dir.Magnitude>1 and centerPos+dir.Unit*math.max(radius*0.75,2) or centerPos+Vector3.new(0,0,math.min(radius*0.75,2))
+            return fallback
+        end
+    end
+    return bestTotemPos or bestPos
+end
+
+-- // 8. SECTION LABEL //
+local function CreateSectionLabel(labelText)
+    local lf=Instance.new("Frame"); lf.Size=UDim2.new(1,0,0,26); lf.BackgroundTransparency=1; lf.Parent=Container
+    local lineL=Instance.new("Frame"); lineL.Size=UDim2.new(0.22,0,0,1); lineL.Position=UDim2.new(0,0,0.5,0)
+    lineL.BackgroundColor3=Theme.Accent; lineL.BorderSizePixel=0; lineL.Parent=lf
+    local gradL=Instance.new("UIGradient"); gradL.Color=ColorSequence.new({ColorSequenceKeypoint.new(0,Color3.new(0,0,0)),ColorSequenceKeypoint.new(1,Theme.Accent)})
+    gradL.Transparency=NumberSequence.new({NumberSequenceKeypoint.new(0,1),NumberSequenceKeypoint.new(1,0.6)}); gradL.Parent=lineL
+    local lineR=Instance.new("Frame"); lineR.Size=UDim2.new(0.22,0,0,1); lineR.Position=UDim2.new(0.78,0,0.5,0)
+    lineR.BackgroundColor3=Theme.Accent; lineR.BorderSizePixel=0; lineR.Parent=lf
+    local gradR=Instance.new("UIGradient"); gradR.Color=ColorSequence.new({ColorSequenceKeypoint.new(0,Theme.Accent),ColorSequenceKeypoint.new(1,Color3.new(0,0,0))})
+    gradR.Transparency=NumberSequence.new({NumberSequenceKeypoint.new(0,0.6),NumberSequenceKeypoint.new(1,1)}); gradR.Parent=lineR
+    local pill=Instance.new("Frame"); pill.Size=UDim2.new(0.56,0,1,0); pill.Position=UDim2.new(0.22,0,0,0)
+    pill.BackgroundColor3=Color3.fromRGB(14,28,22); pill.ZIndex=2; pill.Parent=lf
+    Instance.new("UICorner",pill).CornerRadius=UDim.new(1,0)
+    local pillStroke=Instance.new("UIStroke"); pillStroke.Color=Theme.Accent; pillStroke.Thickness=1; pillStroke.Transparency=0.65; pillStroke.Parent=pill
+    local lbl=Instance.new("TextLabel"); lbl.Size=UDim2.new(1,0,1,0); lbl.BackgroundTransparency=1; lbl.Text=labelText
+    lbl.TextColor3=Theme.Accent; lbl.Font=Enum.Font.GothamBlack; lbl.TextSize=9; lbl.ZIndex=3; lbl.Parent=pill
+end
+
+CreateSectionLabel("AUTOMATION")
+CreateModernToggle("Auto Shovel","Automatically fills your pan with sand at 100% Quality.",function(val) Config.AutoShovel=val end)
+CreateModernToggle("Auto Pan & Shake","Automatically washes the sand in water.",function(val) Config.AutoShake=val end)
+CreateModernToggle("Auto Sell","Walks to the nearest NPC Seller when bag is full, sells, then returns.",function(val) Config.AutoSell=val end)
+
+CreateSectionLabel("ADVANCED")
+CreateModernToggle("Auto Place Totem","Automatically walks to the 'Totem Spot' and places missing totems (Luck, Strength, Luminant) using Keybinds 4, 5, 6.",function(val)
+    Config.AutoTotem=val; if not val then Config.IsPlacingTotem=false end
+end)
+
+local GeodeOriginCFrame=nil
+CreateModernToggle("Auto Collect Geodes","Teleports to Geodes in workspace.Geode, collects them, and returns to start.",function(val)
+    Config.AutoGeode=val
+    if not val then
+        if Config.IsGeodeCollecting and GeodeOriginCFrame then
+            local Char=LocalPlayer.Character; local Root=Char and Char:FindFirstChild("HumanoidRootPart")
+            if Root then Root.CFrame=GeodeOriginCFrame end
+        end
+        Config.IsGeodeCollecting=false; GeodeOriginCFrame=nil
+    end
+end)
+
+CreateSectionLabel("TOOLS")
+CreateActionButtons()
+
+-- SPOT PICKER
+local function CreatePickSpotsUI()
+    CreateSectionLabel("SPOT PICKER")
+    local Holder=Instance.new("Frame"); Holder.Size=UDim2.new(1,0,0,36); Holder.BackgroundTransparency=1; Holder.Parent=Container
+    local Layout=Instance.new("UIListLayout"); Layout.FillDirection=Enum.FillDirection.Horizontal; Layout.Padding=UDim.new(0,6); Layout.HorizontalAlignment=Enum.HorizontalAlignment.Left; Layout.Parent=Holder
+    local function createSpotBtn(icon,label,saveMsg,configKey)
+        local btn=Instance.new("TextButton"); btn.Size=UDim2.new(0.333,-5,1,0); btn.BackgroundColor3=Theme.Panel
+        btn.TextColor3=Theme.TextDim; btn.Font=Enum.Font.GothamBold; btn.TextSize=11; btn.TextWrapped=true
+        btn.Text=icon.."\n"..label; btn.LineHeight=1.2; btn.AutoButtonColor=false; btn.Parent=Holder
+        Instance.new("UICorner",btn).CornerRadius=UDim.new(0,9)
+        local bs=Instance.new("UIStroke"); bs.Color=Theme.Stroke; bs.Thickness=1; bs.Transparency=0.6; bs.Parent=btn
+        btn.MouseEnter:Connect(function()
+            TweenService:Create(bs,TweenInfo.new(0.15),{Color=Theme.Accent,Transparency=0.3}):Play()
+            TweenService:Create(btn,TweenInfo.new(0.15),{TextColor3=Theme.Accent}):Play()
+        end)
+        btn.MouseLeave:Connect(function()
+            TweenService:Create(bs,TweenInfo.new(0.15),{Color=Theme.Stroke,Transparency=0.6}):Play()
+            TweenService:Create(btn,TweenInfo.new(0.15),{TextColor3=Theme.TextDim}):Play()
+        end)
+        btn.MouseButton1Click:Connect(function()
+            local Char=LocalPlayer.Character; local Root=Char and Char:FindFirstChild("HumanoidRootPart")
+            if Root then
+                Config[configKey]=Root.Position; Config.StatusMessageOverride=saveMsg
+                TweenService:Create(bs,TweenInfo.new(0.1),{Color=Theme.Accent,Transparency=0}):Play()
+                task.delay(1.5,function() Config.StatusMessageOverride=nil; TweenService:Create(bs,TweenInfo.new(0.3),{Color=Theme.Stroke,Transparency=0.6}):Play() end)
+            end
+        end)
+    end
+    createSpotBtn("⛏","Sand Spot","Sand spot saved!","SandSpot")
+    createSpotBtn("💧","Water Spot","Water spot saved!","WaterSpot")
+    createSpotBtn("🗿","Totem Spot","Totem spot saved!","TotemSpot")
+    CreateModernToggle("Auto Manual Walk","Walk between your picked Sand and Water spots (requires both spots set).",function(val)
+        if val then
+            if not (Config.SandSpot and Config.WaterSpot) then
+                if ToggleUpdaters["Auto Manual Walk"] then ToggleUpdaters["Auto Manual Walk"](false) end
+                Config.AutoManualWalk=false; Config.StatusMessageOverride="Pick both Sand & Water spots first!"
+                task.delay(2,function() Config.StatusMessageOverride=nil end); return
+            end
+            Config.AutoManualWalk=true
+        else
+            Config.AutoManualWalk=false
+        end
+    end)
+end
+CreatePickSpotsUI()
+
+-- // RUNTIME TIMERS //
+local debugTimer=0; local lockTimer=0; local cleanupTimer=0
+
+-- // AUTOLOAD //
+task.spawn(function()
+    task.wait(1); local auto=GetAutoload()
+    if auto then print("Autoloading:",auto); LoadConfig(auto) end
+end)
+
+-- // GEODE LOOP //
+task.spawn(function()
+    while _G.SigmaFarm_Running do
+        task.wait(1)
+        if Config.AutoGeode and not Config.IsSelling and not Config.IsGeodeCollecting and not Config.IsPlacingTotem and not IsShakingActionActive() then
+            local GeodeFolder=workspace:FindFirstChild("Geode")
+            if GeodeFolder then
+                local targets={}; for _,v in pairs(GeodeFolder:GetChildren()) do if v:IsA("Model") then table.insert(targets,v) end end
+                if #targets>0 then
+                    Config.IsGeodeCollecting=true
+                    local Char=LocalPlayer.Character; local Root=Char and Char:FindFirstChild("HumanoidRootPart")
+                    if Root then
+                        if not GeodeOriginCFrame then GeodeOriginCFrame=Root.CFrame end
+                        for _,geode in pairs(targets) do
+                            if not Config.AutoGeode or not _G.SigmaFarm_Running then break end
+                            if geode and geode.Parent then
+                                Root.CFrame=geode.PrimaryPart and geode.PrimaryPart.CFrame or geode:GetPivot(); task.wait(0.8)
+                            end
+                        end
+                        if Config.AutoGeode and _G.SigmaFarm_Running then Root.CFrame=GeodeOriginCFrame; GeodeOriginCFrame=nil end
+                    end
+                    Config.IsGeodeCollecting=false
+                end
+            end
+        end
+    end
+end)
+
+-- // TOTEM LOOP //
+local TotemPlaceCooldown={Luck=0,Strength=0,Luminant=0}
+local SlotKeys={[1]=Enum.KeyCode.One,[2]=Enum.KeyCode.Two,[3]=Enum.KeyCode.Three,[4]=Enum.KeyCode.Four,[5]=Enum.KeyCode.Five,[6]=Enum.KeyCode.Six,[7]=Enum.KeyCode.Seven,[8]=Enum.KeyCode.Eight,[9]=Enum.KeyCode.Nine}
+
+local KnownPans={["Metal Pan"]=true,["Silver Pan"]=true,["Golden Pan"]=true,["Diamond Pan"]=true,["Aurora Pan"]=true,["Magnetic Pan"]=true,["Dragonflame Pan"]=true,["Abyssal Pan"]=true,["Blightflow Pan"]=true,["Fossilized Pan"]=true}
+local function IsPanTool(tool)
+    if not tool or not tool:IsA("Tool") then return false end
+    if KnownPans[tool.Name] then return true end
+    local scripts=tool:FindFirstChild("Scripts")
+    if scripts and (scripts:FindFirstChild("Pan") or scripts:FindFirstChild("Shake") or scripts:FindFirstChild("Collect")) then return true end
+    return false
+end
+local function GetBackpack() return LocalPlayer:FindFirstChild("BackpackTwo") or LocalPlayer:FindFirstChild("Backpack") end
+local function FindPanAnywhere(savedPanName)
+    local Char=LocalPlayer.Character; local backpack=GetBackpack()
+    if savedPanName then
+        if Char then local t=Char:FindFirstChild(savedPanName); if t and t:IsA("Tool") then return t end end
+        if backpack then local t=backpack:FindFirstChild(savedPanName); if t and t:IsA("Tool") then return t end end
+    end
+    if Char then for _,t in pairs(Char:GetChildren()) do if IsPanTool(t) then return t end end end
+    if backpack then for _,t in pairs(backpack:GetChildren()) do if IsPanTool(t) then return t end end end
+    return nil
+end
+local function FindToolByName(partialName)
+    local Char=LocalPlayer.Character; local backpack=GetBackpack()
+    if Char then for _,t in pairs(Char:GetChildren()) do if t:IsA("Tool") and t.Name:find(partialName) then return t end end end
+    if backpack then for _,t in pairs(backpack:GetChildren()) do if t:IsA("Tool") and t.Name:find(partialName) then return t end end end
+    return nil
+end
+local function GetToolHotkey(tool)
+    local slot=tool:GetAttribute("NewHotbarSlot")
+    if slot and SlotKeys[slot] then return SlotKeys[slot] end
+    local backpack=GetBackpack()
+    if backpack then local idx=1; for _,t in pairs(backpack:GetChildren()) do if t:IsA("Tool") then if t==tool and SlotKeys[idx] then return SlotKeys[idx] end; idx=idx+1 end end end
+    return nil
+end
+local function PressHotkey(keyCode)
+    VirtualInputManager:SendKeyEvent(true,keyCode,false,game); task.wait(0.05)
+    VirtualInputManager:SendKeyEvent(false,keyCode,false,game); task.wait(0.15)
+end
+local function GetPanHotkey()
+    local pan=GetEquippedPan() or FindPanAnywhere()
+    if pan then local slot=pan:GetAttribute("NewHotbarSlot"); if slot and SlotKeys[slot] then return SlotKeys[slot] end end
+    return Enum.KeyCode.One
+end
+
+task.spawn(function()
+    while _G.SigmaFarm_Running do
+        task.wait(1)
+        if Config.AutoTotem and not Config.IsSelling and not Config.IsGeodeCollecting and not IsShakingActionActive() then
+            local Char=LocalPlayer.Character; local Root=Char and Char:FindFirstChild("HumanoidRootPart"); local Humanoid=Char and Char:FindFirstChild("Humanoid")
+            if Root and Humanoid and Config.TotemSpot then
+                local function placeOne(name)
+                    if not Config.AutoTotem then return end
+                    if tick()-(TotemPlaceCooldown[name] or 0)<90 then return end
+                    if GetSpecificTotem(Config.TotemSpot,name) then return end
+                    local totemTool=FindToolByName(name); if not totemTool then return end
+                    local hotkey=GetToolHotkey(totemTool); if not hotkey then return end
+                    Config.IsPlacingTotem=true; Config.StatusMessageOverride="Walking to place "..name.."..."
+                    local walkTimeout=tick()+6
+                    while Config.AutoTotem and Root and (Root.Position-Config.TotemSpot).Magnitude>6 and tick()<walkTimeout do
+                        SimpleWalkTo(Config.TotemSpot); task.wait(0.15)
+                    end
+                    if not Config.AutoTotem then return end
+                    if not Root or (Root.Position-Config.TotemSpot).Magnitude>8 then return end
+                    if GetSpecificTotem(Config.TotemSpot,name) then return end
+                    Config.StatusMessageOverride="Placing "..name.."..."; TotemPlaceCooldown[name]=tick()
+                    PressHotkey(hotkey); task.wait(0.5)
+                    local equippedTool=nil; local equipDeadline=tick()+2
+                    while tick()<equipDeadline do
+                        local t=Char:FindFirstChildOfClass("Tool"); if t and t.Name:find(name) then equippedTool=t; break end; task.wait(0.1)
+                    end
+                    if equippedTool then
+                        Root.CFrame=CFrame.new(Root.Position,Config.TotemSpot); task.wait(0.15)
+                        local alreadyPlaced=GetSpecificTotem(Config.TotemSpot,name)~=nil
+                        if not alreadyPlaced then pcall(function() equippedTool:Activate() end); task.wait(0.4) end
+                    end
+                    PressHotkey(GetPanHotkey()); task.wait(0.8)
+                    local verifyDeadline=tick()+5
+                    while tick()<verifyDeadline do if GetSpecificTotem(Config.TotemSpot,name) then break end; task.wait(0.2) end
+                    task.wait(0.3)
+                end
+                placeOne("Luck"); placeOne("Strength"); placeOne("Luminant")
+                if Config.IsPlacingTotem then
+                    Config.IsPlacingTotem=false; Config.StatusMessageOverride="Re-equipping Pan..."
+                    PressHotkey(GetPanHotkey()); task.wait(1); Config.StatusMessageOverride=nil
+                end
+            end
+        end
+    end
+end)
+
+-- // AUTO WALK LOOP //
+task.spawn(function()
+    local lastMode=nil
+    while _G.SigmaFarm_Running do
+        task.wait(0.1)
+        repeat
+        local Char=LocalPlayer.Character; local Root=Char and Char:FindFirstChild("HumanoidRootPart"); local Humanoid=Char and Char:FindFirstChild("Humanoid")
+        if not Root or not Humanoid then break end
+        if not Config.AutoManualWalk or not Config.SandSpot or not Config.WaterSpot then Config.IsMoving=false; Config.CurrentTarget=nil; lastMode=nil; break end
+        if Config.IsSelling or Config.IsGeodeCollecting or Config.IsPlacingTotem or Config.IsPanning then Config.IsMoving=false; lastMode=nil; break end
+        local Pan=GetEquippedPan(); local fill=GetFillAmount(Pan); local cap=GetCapacity(Pan)
+        local mode,target
+        if fill>=cap then mode="Water"; target=Config.WaterSpot; Config.CurrentTarget="Water"
+        else mode="Sand"; target=Config.SandSpot; Config.CurrentTarget="Deposit" end
+        local dist=(Root.Position-target).Magnitude
+        if Config.IsMoving then
+            if dist<=4 then Config.IsMoving=false; lastMode=mode; Humanoid.WalkToPoint=Root.Position
+            else Humanoid.WalkToPoint=target end
+        else
+            if lastMode~=mode or dist>8 then Config.IsMoving=true; lastMode=mode; Humanoid.WalkToPoint=target end
+        end
+        until true
+    end
+end)
+
+-- // FARM LOOP //
+local FarmLoop=RunService.Heartbeat:Connect(function(dt)
+    if not _G.SigmaFarm_Running then return end
+    if tick()-lockTimer>1 then
+        lockTimer=tick()
+        if Config.AutoSell and LockRemote then
+            local backpack=LocalPlayer:FindFirstChild("BackpackTwo") or LocalPlayer:FindFirstChild("Backpack")
+            if backpack then
+                for _,item in pairs(backpack:GetChildren()) do
+                    if Config.LockedItems[item.Name] and not Config.ProcessedInstances[item] then
+                        Config.ProcessedInstances[item]=true; LockRemote:FireServer(item)
+                    end
+                end
+            end
+        end
+    end
+    cleanupTimer=cleanupTimer+dt
+    if cleanupTimer>=10 then cleanupTimer=0; for item,_ in pairs(Config.ProcessedInstances) do if not item.Parent then Config.ProcessedInstances[item]=nil end end end
+    local PanTool=GetEquippedPan()
+    if not PanTool then
+        MainStatusLabel.Text="Equip your Pan  (Slot 1)"; MainStatusLabel.TextColor3=Theme.Red
+        TweenService:Create(StatusDot,TweenInfo.new(0.2),{BackgroundColor3=Theme.Red}):Play()
+        TweenService:Create(ProgressBar,TweenInfo.new(0.4),{Size=UDim2.new(0,0,1,0)}):Play(); return
+    end
+    local CurrentFill=GetFillAmount(PanTool); local MaxCap=GetCapacity(PanTool)
+    local StateText=GetStateLabel(); local BagCurrent,BagMax=GetInventoryStatus()
+    local Char=LocalPlayer.Character; local Root=Char and Char:FindFirstChild("HumanoidRootPart"); local Humanoid=Char and Char:FindFirstChild("Humanoid")
+    if tick()-debugTimer>0.1 then
+        debugTimer=tick()
+        pcall(function()
+            local pct=math.clamp(CurrentFill/MaxCap,0,1)
+            TweenService:Create(ProgressBar,TweenInfo.new(0.25),{Size=UDim2.new(pct,0,1,0)}):Play()
+            local barColor=pct>=1 and Theme.Orange or Theme.Accent
+            TweenService:Create(ProgressBar,TweenInfo.new(0.25),{BackgroundColor3=barColor}):Play()
+            FillPctLabel.Text=math.floor(pct*100).."%"; FillPctLabel.TextColor3=pct>=1 and Theme.Orange or Theme.Accent
+            if Config.StatusMessageOverride then
+                MainStatusLabel.Text=Config.StatusMessageOverride; MainStatusLabel.TextColor3=Theme.Orange
+                TweenService:Create(StatusDot,TweenInfo.new(0.2),{BackgroundColor3=Theme.Orange}):Play()
+            else
+                local status="Idle"; local dotColor=Theme.TextDim
+                if Config.IsPlacingTotem then status="Placing Totem..."; dotColor=Color3.fromRGB(180,120,255)
+                elseif Config.IsGeodeCollecting then status="Collecting Geodes..."; dotColor=Color3.fromRGB(80,180,255)
+                elseif Config.IsSelling then status="Selling items..."; dotColor=Theme.Orange
+                elseif Config.IsPanning then status="Panning..."; dotColor=Theme.Accent
+                elseif Config.IsMoving then status="Walking  →  "..(Config.CurrentTarget or "?"); dotColor=Theme.Accent
+                elseif CurrentFill>=MaxCap then status="Pan full — go to water"; dotColor=Theme.Orange
+                elseif Config.AutoShovel then status="Digging..."; dotColor=Theme.Accent end
+                MainStatusLabel.Text=string.format("%s  (%d/%d)",status,CurrentFill,MaxCap); MainStatusLabel.TextColor3=Theme.TextMain
+                TweenService:Create(StatusDot,TweenInfo.new(0.2),{BackgroundColor3=dotColor}):Play()
+            end
+            BagLabel.Text=string.format("Bag: %d / %d%s",BagCurrent,BagMax,Config.AutoSell and "  [AUTO-SELL]" or "")
+            BagLabel.TextColor3=(BagCurrent>=BagMax) and Theme.Red or Theme.TextDim
+        end)
+    end
+    if Config.IsSelling or Config.IsGeodeCollecting or Config.IsPlacingTotem or Config.IsMoving then return end
+    if Config.AutoSell and BagCurrent>=BagMax and not Config.IsSelling and not IsShakingActionActive() then
+        Config.IsSelling=true
+        task.spawn(function()
+            local Char2=LocalPlayer.Character; local Root2=Char2 and Char2:FindFirstChild("HumanoidRootPart")
+            if Root2 then
+                local originalPos=Root2.Position
+                local merchantPos=GetNearestMerchant(); local dist=merchantPos and (Root2.Position-merchantPos).Magnitude or math.huge
+                if not merchantPos or dist>400 then
+                    Config.StatusMessageOverride="Seller not found (<400 studs)!"; task.wait(3); Config.StatusMessageOverride=nil; Config.IsSelling=false; return
+                end
+                local function IsBagEmpty()
+                    local valCount=0
+                    local bp2=LocalPlayer:FindFirstChild("BackpackTwo") or LocalPlayer:FindFirstChild("Backpack")
+                    if bp2 then for _,v in pairs(bp2:GetChildren()) do if v:GetAttribute("ItemType")=="Valuable" and not Config.LockedItems[v.Name] then valCount=valCount+1 end end end
+                    if LocalPlayer.Character then for _,v in pairs(LocalPlayer.Character:GetChildren()) do if v:IsA("Tool") and v:GetAttribute("ItemType")=="Valuable" and not Config.LockedItems[v.Name] then valCount=valCount+1 end end end
+                    return valCount==0
+                end
+                local function GetApproachPos(mPos)
+                    local Root3=LocalPlayer.Character and LocalPlayer.Character:FindFirstChild("HumanoidRootPart")
+                    if Root3 then
+                        local dir=(Root3.Position-mPos); if dir.Magnitude>0.1 then return mPos+dir.Unit*4 end
+                    end
+                    return mPos+Vector3.new(4,0,0)
+                end
+                Config.StatusMessageOverride="Walking to merchant..."
+                SmartWalkTo(GetApproachPos(merchantPos),function() return not Config.IsSelling end)
+                if not Config.IsSelling then Config.IsSelling=false; return end
+                local Humanoid2=Char2 and Char2:FindFirstChild("Humanoid")
+                if Humanoid2 then Humanoid2:MoveTo(Root2.Position) end
+                Config.StatusMessageOverride="Selling..."
+                local sellAttempts=0
+                while sellAttempts<8 and not IsBagEmpty() and Config.IsSelling do
+                    if SellRemote then pcall(function() SellRemote:InvokeServer() end) end
+                    sellAttempts=sellAttempts+1; task.wait(0.35); if IsBagEmpty() then break end
+                end
+                if Humanoid2 then Humanoid2:MoveTo(Root2.Position) end
+                Config.StatusMessageOverride=nil
+                if (Root2.Position-originalPos).Magnitude>10 then
+                    Config.StatusMessageOverride="Returning..."
+                    SmartWalkTo(originalPos,function() return not Config.IsSelling end)
+                    Config.StatusMessageOverride=nil
+                end
+                if Humanoid2 then Humanoid2:MoveTo(Root2.Position) end
+            end
+            Config.IsSelling=false
+        end)
+    end
+    if Config.IsSelling or Config.IsGeodeCollecting then return end
+    if Config.AutoShovel and not Config.IsPanning then
+        if CurrentFill<MaxCap and StateText~="Pan" then
+            local collect=PanTool.Scripts:FindFirstChild("Collect")
+            if collect and collect:IsA("RemoteFunction") then collect:InvokeServer(1) end
+        end
+    end
+    if Config.AutoShake and not Config.IsPanning then
+        local isLegitWater=false
+        if StateText=="Pan" then
+            if Root and CheckRegion(Root.Position)~="Deposit" then isLegitWater=true end
+        end
+        if CurrentFill>0 and isLegitWater then
+            Config.IsPanning=true
+            local panRemote=PanTool.Scripts:FindFirstChild("Pan"); local shakeRemote=PanTool.Scripts:FindFirstChild("Shake")
+            if panRemote and shakeRemote then
+                task.wait(0.3); panRemote:InvokeServer()
+                local lastFill=GetFillAmount(PanTool); local lastChangeTime=tick()
+                while Config.AutoShake and GetFillAmount(PanTool)>0 and GetEquippedPan() do
+                    if Root and CheckRegion(Root.Position)=="Deposit" then break end
+                    local currentFill=GetFillAmount(PanTool)
+                    if currentFill<lastFill then lastFill=currentFill; lastChangeTime=tick()
+                    elseif tick()-lastChangeTime>1.5 then panRemote:InvokeServer(); lastChangeTime=tick() end
+                    shakeRemote:FireServer(); task.wait()
+                end
+            end
+            Config.IsPanning=false
+            if GetFillAmount(PanTool)==0 then Config.CurrentTarget="Deposit" end
+        end
+    end
+end)
+
+table.insert(_G.SigmaFarm_Connections, FarmLoop)
+warn("SIGMA HUB - REMASTERED loaded successfully.")
